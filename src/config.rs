@@ -8,10 +8,16 @@ use serde::Deserialize;
 pub(crate) struct Config {
     #[serde(default = "default_diff_tool")]
     pub(crate) diff_tool: String,
+    #[serde(default = "default_pager")]
+    pub(crate) pager: String,
 }
 
 fn default_diff_tool() -> String {
-    "difft".to_string()
+    "difft --color always".to_string()
+}
+
+fn default_pager() -> String {
+    "less -R".to_string()
 }
 
 impl Config {
@@ -21,17 +27,26 @@ impl Config {
             let raw = std::fs::read_to_string(&path)?;
             toml::from_str(&raw)?
         } else {
-            Config { diff_tool: default_diff_tool() }
+            Config { diff_tool: default_diff_tool(), pager: default_pager() }
+
         };
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
-        if which::which(&self.diff_tool).is_err() {
+        let diff_bin = self.diff_tool.split_whitespace().next().unwrap_or("");
+        if diff_bin.is_empty() || which::which(diff_bin).is_err() {
             bail!(
                 "diff tool '{}' not found on PATH — install it or set a different tool in .grit.toml",
                 self.diff_tool
+            );
+        }
+        let pager_bin = self.pager.split_whitespace().next().unwrap_or("");
+        if !pager_bin.is_empty() && which::which(pager_bin).is_err() {
+            bail!(
+                "pager '{}' not found on PATH — install it or set a different pager in .grit.toml",
+                pager_bin
             );
         }
         Ok(())

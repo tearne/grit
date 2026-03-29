@@ -46,6 +46,7 @@ fn run(args: Args) -> Result<()> {
         &mut checklist,
         &repo_root,
         &config.diff_tool,
+        &config.pager,
         worktree_a.path(),
         worktree_b.path(),
     )?;

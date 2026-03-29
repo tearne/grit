@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use color_eyre::eyre::Result;
@@ -42,6 +43,7 @@ impl Tui {
         checklist: &mut Checklist,
         repo_root: &Path,
         diff_tool: &str,
+        pager: &str,
         worktree_a: &Path,
         worktree_b: &Path,
     ) -> Result<()> {
@@ -54,7 +56,7 @@ impl Tui {
                     if let Some(file) = checklist.selected_file() {
                         let path_a = worktree_a.join(&file.path);
                         let path_b = worktree_b.join(&file.path);
-                        self.open_diff(diff_tool, &path_a, &path_b)?;
+                        self.open_diff(diff_tool, pager, &path_a, &path_b)?;
                     }
                 }
                 LoopControl::CopyPath => {
@@ -70,17 +72,32 @@ impl Tui {
         }
     }
 
-    fn open_diff(&mut self, diff_tool: &str, path_a: &Path, path_b: &Path) -> Result<()> {
+    fn open_diff(&mut self, diff_tool: &str, pager: &str, path_a: &Path, path_b: &Path) -> Result<()> {
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
-        std::process::Command::new(diff_tool)
-            .arg(path_a)
-            .arg(path_b)
-            .status()?;
+        let null = Path::new("/dev/null");
+        let mut diff_parts = diff_tool.split_whitespace();
+        let diff_bin = diff_parts.next().unwrap_or(diff_tool);
+        let mut diff = std::process::Command::new(diff_bin)
+            .args(diff_parts)
+            .arg(if path_a.exists() { path_a } else { null })
+            .arg(if path_b.exists() { path_b } else { null })
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        let mut pager_parts = pager.split_whitespace();
+        if let Some(pager_bin) = pager_parts.next() {
+            std::process::Command::new(pager_bin)
+                .args(pager_parts)
+                .stdin(Stdio::from(diff.stdout.take().unwrap()))
+                .status()?;
+        }
+
+        diff.wait()?;
 
         enable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         self.terminal.clear()?;
 
         Ok(())
@@ -149,11 +166,7 @@ impl Tui {
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-        );
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         let _ = self.terminal.show_cursor();
     }
 }

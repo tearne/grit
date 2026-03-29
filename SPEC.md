@@ -19,7 +19,8 @@ Both refs are required. Either may be a branch name, a tag, a commit SHA, or the
 Configuration is read from `.grit.toml` at the repository root. All fields are optional.
 
 ```toml
-diff_tool = "difft"   # difft | delta; default: difft
+diff_tool = "difft --color always"  # default: difft
+pager     = "less -R"               # default: less -R
 ```
 
 ## Behaviour
