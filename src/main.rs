@@ -1,19 +1,26 @@
+mod ansi;
 mod checklist;
 mod clipboard;
 mod config;
+mod git;
 mod session;
 mod tui;
 mod worktree;
 
 use clap::Parser;
-use color_eyre::eyre::{bail, Result, WrapErr};
-use git2::Repository;
+use color_eyre::eyre::{bail, Result};
 
 #[derive(Parser)]
-#[command(name = "grit", about = "Git Review In Terminal")]
+#[command(name = "grit", about = "Git Review In Terminal", version)]
 struct Args {
     ref_a: String,
-    ref_b: String,
+    ref_b: Option<String>,
+}
+
+impl Args {
+    fn resolve(self) -> (String, String) {
+        (self.ref_a, self.ref_b.unwrap_or_else(|| ".".to_string()))
+    }
 }
 
 fn main() -> Result<()> {
@@ -23,22 +30,19 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
-    validate_refs(&args.ref_a, &args.ref_b)?;
+    let (ref_a, ref_b) = args.resolve();
+    validate_refs(&ref_a, &ref_b)?;
 
-    let repo = Repository::discover(".").wrap_err("not inside a git repository")?;
-    let repo_root = repo
-        .workdir()
-        .ok_or_else(|| color_eyre::eyre::eyre!("bare repositories are not supported"))?
-        .to_path_buf();
+    let repo_root = git::repo_root()?;
 
     let config = config::Config::load(&repo_root)?;
 
     let worktrees_dir = repo_root.join(".grit").join("worktrees");
-    let worktree_a = worktree::create(&repo_root, &args.ref_a, &worktrees_dir)?;
-    let worktree_b = worktree::create(&repo_root, &args.ref_b, &worktrees_dir)?;
+    let worktree_a = worktree::create(&repo_root, &ref_a, &worktrees_dir)?;
+    let worktree_b = worktree::create(&repo_root, &ref_b, &worktrees_dir)?;
 
     let session =
-        session::Session::load_or_create(&repo, &repo_root, &args.ref_a, &args.ref_b)?;
+        session::Session::load_or_create(&repo_root, &ref_a, &ref_b)?;
     let mut checklist = checklist::Checklist::new(session);
 
     let mut tui = tui::Tui::new()?;
@@ -46,7 +50,6 @@ fn run(args: Args) -> Result<()> {
         &mut checklist,
         &repo_root,
         &config.diff_tool,
-        &config.pager,
         worktree_a.path(),
         worktree_b.path(),
     )?;

@@ -3,6 +3,8 @@ use std::process::Command;
 
 use color_eyre::eyre::{bail, Result};
 
+use crate::git;
+
 pub(crate) enum Worktree {
     Checkout { path: PathBuf },
     WorkingTree { path: PathBuf },
@@ -22,7 +24,7 @@ pub(crate) fn create(repo_root: &Path, git_ref: &str, worktrees_dir: &Path) -> R
         return Ok(Worktree::WorkingTree { path: repo_root.to_path_buf() });
     }
 
-    let path = worktrees_dir.join(sanitise_ref(git_ref));
+    let path = worktrees_dir.join(git::sanitise_ref(git_ref));
     if path.exists() {
         return Ok(Worktree::Checkout { path });
     }
@@ -61,6 +63,3 @@ pub(crate) fn remove(repo_root: &Path, worktree: Worktree) -> Result<()> {
     Ok(())
 }
 
-fn sanitise_ref(git_ref: &str) -> String {
-    git_ref.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "-")
-}

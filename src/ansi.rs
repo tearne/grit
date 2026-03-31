@@ -1,0 +1,148 @@
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+};
+
+/// Parse a byte slice containing ANSI SGR escape sequences into ratatui `Text`.
+///
+/// Only SGR sequences are handled (colors, bold, reset) — the subset difft
+/// outputs. All other escape sequences are stripped silently.
+pub(crate) fn parse(bytes: &[u8]) -> Text<'static> {
+    let raw = String::from_utf8_lossy(bytes);
+    let lines: Vec<Line<'static>> = raw.split('\n').map(parse_line).collect();
+    Text::from(lines)
+}
+
+fn parse_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut remaining = line;
+
+    while !remaining.is_empty() {
+        if let Some(esc_start) = remaining.find('\x1b') {
+            // Emit text before the escape sequence.
+            if esc_start > 0 {
+                spans.push(Span::styled(remaining[..esc_start].to_owned(), style));
+            }
+            remaining = &remaining[esc_start..];
+
+            // Try to consume an SGR sequence: ESC [ ... m
+            if let Some(seq_end) = parse_sgr(remaining) {
+                let params = &remaining[2..seq_end]; // between '[' and 'm'
+                style = apply_sgr(style, params);
+                remaining = &remaining[seq_end + 1..];
+            } else {
+                // Not a recognised sequence — skip the ESC byte and continue.
+                remaining = &remaining[1..];
+            }
+        } else {
+            spans.push(Span::styled(remaining.to_owned(), style));
+            break;
+        }
+    }
+
+    Line::from(spans)
+}
+
+/// If `s` starts with an SGR sequence (`ESC [ ... m`), returns the index of
+/// the terminating `m`. Returns `None` if the sequence is absent or malformed.
+fn parse_sgr(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    if chars.next()? != '\x1b' || chars.next()? != '[' {
+        return None;
+    }
+    // Find the 'm' terminator; bail if a non-SGR terminator appears first.
+    let rest = &s[2..];
+    let end = rest.find(|c: char| c.is_ascii_alphabetic())?;
+    if rest.as_bytes()[end] == b'm' {
+        Some(2 + end)
+    } else {
+        None
+    }
+}
+
+fn apply_sgr(base: Style, params: &str) -> Style {
+    let codes: Vec<u8> = params
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    let mut style = base;
+    let mut i = 0;
+
+    while i < codes.len() {
+        match codes[i] {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            9 => style = style.add_modifier(Modifier::CROSSED_OUT),
+            // Standard foreground colours.
+            30..=37 => style = style.fg(ansi_color(codes[i] - 30, false)),
+            38 if codes.get(i + 1) == Some(&5) => {
+                if let Some(&n) = codes.get(i + 2) {
+                    style = style.fg(Color::Indexed(n));
+                    i += 2;
+                }
+            }
+            38 if codes.get(i + 1) == Some(&2) => {
+                if let (Some(&r), Some(&g), Some(&b)) =
+                    (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                {
+                    style = style.fg(Color::Rgb(r, g, b));
+                    i += 4;
+                }
+            }
+            39 => style = style.fg(Color::Reset),
+            // Standard background colours.
+            40..=47 => style = style.bg(ansi_color(codes[i] - 40, false)),
+            48 if codes.get(i + 1) == Some(&5) => {
+                if let Some(&n) = codes.get(i + 2) {
+                    style = style.bg(Color::Indexed(n));
+                    i += 2;
+                }
+            }
+            48 if codes.get(i + 1) == Some(&2) => {
+                if let (Some(&r), Some(&g), Some(&b)) =
+                    (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                {
+                    style = style.bg(Color::Rgb(r, g, b));
+                    i += 4;
+                }
+            }
+            49 => style = style.bg(Color::Reset),
+            // Bright foreground colours.
+            90..=97 => style = style.fg(ansi_color(codes[i] - 90, true)),
+            // Bright background colours.
+            100..=107 => style = style.bg(ansi_color(codes[i] - 100, true)),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    style
+}
+
+fn ansi_color(index: u8, bright: bool) -> Color {
+    match (index, bright) {
+        (0, false) => Color::Black,
+        (1, false) => Color::Red,
+        (2, false) => Color::Green,
+        (3, false) => Color::Yellow,
+        (4, false) => Color::Blue,
+        (5, false) => Color::Magenta,
+        (6, false) => Color::Cyan,
+        (7, false) => Color::Gray,
+        (0, true) => Color::DarkGray,
+        (1, true) => Color::LightRed,
+        (2, true) => Color::LightGreen,
+        (3, true) => Color::LightYellow,
+        (4, true) => Color::LightBlue,
+        (5, true) => Color::LightMagenta,
+        (6, true) => Color::LightCyan,
+        (7, true) => Color::White,
+        _ => Color::Reset,
+    }
+}

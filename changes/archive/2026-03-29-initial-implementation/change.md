@@ -55,3 +55,15 @@ Intentionally deferred:
 - [x] ADD `clipboard` module — OSC 52 bridge, `:open <path>:<line>` command
 - [x] REVIEW end-to-end: two branch refs, `.` passthrough, state persistence, diff tool missing error
 - [x] REVIEW `SPEC.md` — verify it accurately reflects the delivered behaviour; update any gaps or inaccuracies surfaced during implementation
+
+## Conclusion
+
+Delivered a working end-to-end review session. The core loop — start, navigate, diff, mark reviewed, persist, resume — is functional.
+
+A few things discovered during the smoke test and resolved:
+
+- `git2` default transports pull in OpenSSL; disabled with `default-features = false`. Worktree create/remove shells out to `git` rather than using git2's limited API. Captured in `RATIONALE.md` and a separate `git-shell-out` change for future evaluation.
+- `difft` outputs to stdout and exits immediately (non-interactive). Fixed by piping through a configurable pager (`less -R` by default).
+- Piping strips difft's colour output. Fixed by splitting `diff_tool` on whitespace to support args, with `--color always` in the default.
+- Added `/dev/null` substitution for files absent on one side (added/deleted files).
+- Keyboard bindings clarified in SPEC: `h`/`l` not bound (single-column list), `Esc`/`Ctrl-C` added as quit aliases, `Space` added as alias for `r`, `y` added for clipboard.

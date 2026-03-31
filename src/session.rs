@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
-use git2::{Delta, Oid, Repository};
 use serde::{Deserialize, Serialize};
+
+use crate::git;
 
 pub(crate) struct Session {
     pub(crate) id: String,
@@ -17,11 +18,16 @@ pub(crate) struct FileEntry {
     // Blob hashes at the time this entry was last computed. None when the
     // side is the working tree (no stable hash) or when the file is
     // absent on that side (added/deleted).
-    pub(crate) blob_a: Option<Oid>,
-    pub(crate) blob_b: Option<Oid>,
+    pub(crate) blob_a: Option<String>,
+    pub(crate) blob_b: Option<String>,
+    // Derived from git on each load; not persisted.
+    pub(crate) status: git::FileStatus,
+    pub(crate) old_path: Option<PathBuf>,
+    pub(crate) additions: u32,
+    pub(crate) deletions: u32,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ReviewState {
     Unreviewed,
     ReviewedStable,
@@ -29,13 +35,12 @@ pub(crate) enum ReviewState {
 
 impl Session {
     pub(crate) fn load_or_create(
-        repo: &Repository,
         repo_root: &Path,
         ref_a: &str,
         ref_b: &str,
     ) -> Result<Self> {
         let id = session_id(ref_a, ref_b);
-        let current_files = compute_diff_files(repo, ref_a, ref_b)?;
+        let current_files = git::diff_files(repo_root, ref_a, ref_b)?;
         let persisted = load_persisted(repo_root, &id)?;
         let files = merge_state(current_files, persisted);
         Ok(Session { id, ref_a: ref_a.to_string(), ref_b: ref_b.to_string(), files })
@@ -57,8 +62,8 @@ impl Session {
                     ReviewState::Unreviewed => PersistedState::Unreviewed,
                     ReviewState::ReviewedStable => PersistedState::Reviewed,
                 },
-                blob_a: f.blob_a.map(|oid| oid.to_string()),
-                blob_b: f.blob_b.map(|oid| oid.to_string()),
+                blob_a: f.blob_a.clone(),
+                blob_b: f.blob_b.clone(),
             }).collect(),
         }
     }
@@ -83,7 +88,7 @@ struct PersistedFile {
     blob_b: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum PersistedState {
     Unreviewed,
@@ -93,11 +98,7 @@ enum PersistedState {
 // --- Helpers ---
 
 fn session_id(ref_a: &str, ref_b: &str) -> String {
-    format!("{}__{}", sanitise_ref(ref_a), sanitise_ref(ref_b))
-}
-
-fn sanitise_ref(git_ref: &str) -> String {
-    git_ref.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "-")
+    format!("{}__{}", git::sanitise_ref(ref_a), git::sanitise_ref(ref_b))
 }
 
 fn session_dir(repo_root: &Path, id: &str) -> PathBuf {
@@ -114,18 +115,18 @@ fn load_persisted(repo_root: &Path, id: &str) -> Result<Option<PersistedSession>
 }
 
 fn merge_state(
-    current: Vec<(PathBuf, Option<Oid>, Option<Oid>)>,
+    current: Vec<git::DiffEntry>,
     persisted: Option<PersistedSession>,
 ) -> Vec<FileEntry> {
     let persisted = persisted.unwrap_or(PersistedSession { files: vec![] });
 
-    current.into_iter().map(|(path, blob_a, blob_b)| {
+    current.into_iter().map(|entry| {
         let state = persisted.files.iter()
-            .find(|f| Path::new(&f.path) == path)
+            .find(|f| Path::new(&f.path) == entry.path)
             .and_then(|f| {
                 if f.state == PersistedState::Reviewed
-                    && blobs_match(blob_a, &f.blob_a)
-                    && blobs_match(blob_b, &f.blob_b)
+                    && entry.blob_a == f.blob_a
+                    && entry.blob_b == f.blob_b
                 {
                     Some(ReviewState::ReviewedStable)
                 } else {
@@ -134,73 +135,166 @@ fn merge_state(
             })
             .unwrap_or(ReviewState::Unreviewed);
 
-        FileEntry { path, state, blob_a, blob_b }
+        FileEntry {
+            path: entry.path,
+            state,
+            blob_a: entry.blob_a,
+            blob_b: entry.blob_b,
+            status: entry.status,
+            old_path: entry.old_path,
+            additions: entry.additions,
+            deletions: entry.deletions,
+        }
     }).collect()
 }
 
-fn blobs_match(current: Option<Oid>, persisted: &Option<String>) -> bool {
-    match (current, persisted) {
-        (None, None) => true,
-        (Some(oid), Some(s)) => oid.to_string() == *s,
-        _ => false,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
 
-fn compute_diff_files(
-    repo: &Repository,
-    ref_a: &str,
-    ref_b: &str,
-) -> Result<Vec<(PathBuf, Option<Oid>, Option<Oid>)>> {
-    let diff = if ref_b == "." {
-        let tree_a = resolve_tree(repo, ref_a)?;
-        repo.diff_tree_to_workdir_with_index(Some(&tree_a), None)?
-    } else if ref_a == "." {
-        // Diff from ref_b tree to working directory; blob sides will be swapped below.
-        let tree_b = resolve_tree(repo, ref_b)?;
-        repo.diff_tree_to_workdir_with_index(Some(&tree_b), None)?
-    } else {
-        let tree_a = resolve_tree(repo, ref_a)?;
-        let tree_b = resolve_tree(repo, ref_b)?;
-        repo.diff_tree_to_tree(Some(&tree_a), Some(&tree_b), None)?
+    use super::{
+        load_persisted, merge_state, session_id, PersistedFile, PersistedSession,
+        PersistedState, ReviewState, Session,
     };
+    use crate::git::{DiffEntry, FileStatus};
 
-    let mut files = Vec::new();
-    for delta in diff.deltas() {
-        if matches!(
-            delta.status(),
-            Delta::Unmodified | Delta::Ignored | Delta::Untracked
-        ) {
-            continue;
+    fn oid(hex: &str) -> String {
+        format!("{:0<40}", hex)
+    }
+
+    fn entry(path: &str, blob_a: Option<String>, blob_b: Option<String>) -> DiffEntry {
+        DiffEntry {
+            path: PathBuf::from(path),
+            blob_a,
+            blob_b,
+            status: FileStatus::Modified,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
         }
+    }
 
-        let path = delta.new_file().path()
-            .or_else(|| delta.old_file().path())
-            .map(PathBuf::from)
-            .unwrap_or_default();
+    // --- session_id ---
 
-        let tree_blob = non_zero_oid(delta.old_file().id());
-        let other_blob = non_zero_oid(delta.new_file().id());
+    #[test]
+    fn session_id_joins_refs() {
+        assert_eq!(session_id("main", "feature"), "main__feature");
+    }
 
-        // When ref_a is ".", the working tree is on the old side; assign None
-        // to signal an unstable hash. Otherwise the layout matches the diff
-        // direction (old = ref_a, new = ref_b).
-        let (blob_a, blob_b) = if ref_a == "." {
-            (None, tree_blob)
-        } else {
-            (tree_blob, if ref_b == "." { None } else { other_blob })
+    #[test]
+    fn session_id_sanitises_slashes() {
+        assert_eq!(session_id("refs/heads/main", "feature/foo"), "refs-heads-main__feature-foo");
+    }
+
+    #[test]
+    fn session_id_sanitises_special_chars() {
+        assert_eq!(session_id("a:b*c?", "d<e>f"), "a-b-c-__d-e-f");
+    }
+
+    // --- merge_state ---
+
+    #[test]
+    fn merge_state_no_persisted_all_unreviewed() {
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], None);
+        assert_eq!(entries[0].state, ReviewState::Unreviewed);
+    }
+
+    #[test]
+    fn merge_state_reviewed_stable_survives_matching_blobs() {
+        let persisted = Some(PersistedSession {
+            files: vec![PersistedFile {
+                path: "a.rs".into(),
+                state: PersistedState::Reviewed,
+                blob_a: Some(oid("aa")),
+                blob_b: Some(oid("bb")),
+            }],
+        });
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], persisted);
+        assert_eq!(entries[0].state, ReviewState::ReviewedStable);
+    }
+
+    #[test]
+    fn merge_state_blob_mismatch_resets_to_unreviewed() {
+        let persisted = Some(PersistedSession {
+            files: vec![PersistedFile {
+                path: "a.rs".into(),
+                state: PersistedState::Reviewed,
+                blob_a: Some(oid("aa")),
+                blob_b: Some(oid("bb")), // old blob
+            }],
+        });
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("cc")))], persisted);
+        assert_eq!(entries[0].state, ReviewState::Unreviewed);
+    }
+
+    #[test]
+    fn merge_state_new_file_is_unreviewed() {
+        let entries = merge_state(
+            vec![entry("new.rs", Some(oid("aa")), Some(oid("bb")))],
+            Some(PersistedSession { files: vec![] }),
+        );
+        assert_eq!(entries[0].state, ReviewState::Unreviewed);
+    }
+
+    #[test]
+    fn merge_state_removed_file_is_absent() {
+        let persisted = Some(PersistedSession {
+            files: vec![PersistedFile {
+                path: "gone.rs".into(),
+                state: PersistedState::Reviewed,
+                blob_a: None,
+                blob_b: None,
+            }],
+        });
+        let entries = merge_state(vec![], persisted);
+        assert!(entries.is_empty());
+    }
+
+    // --- Session::save + load_persisted round-trip ---
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+
+        let session = Session {
+            id: "main__feature".into(),
+            ref_a: "main".into(),
+            ref_b: "feature".into(),
+            files: vec![
+                super::FileEntry {
+                    path: PathBuf::from("src/lib.rs"),
+                    state: ReviewState::ReviewedStable,
+                    blob_a: Some(oid("aa")),
+                    blob_b: Some(oid("bb")),
+                    status: FileStatus::Modified,
+                    old_path: None,
+                    additions: 5,
+                    deletions: 2,
+                },
+                super::FileEntry {
+                    path: PathBuf::from("src/main.rs"),
+                    state: ReviewState::Unreviewed,
+                    blob_a: Some(oid("cc")),
+                    blob_b: Some(oid("dd")),
+                    status: FileStatus::Added,
+                    old_path: None,
+                    additions: 10,
+                    deletions: 0,
+                },
+            ],
         };
 
-        files.push((path, blob_a, blob_b));
+        session.save(repo_root).unwrap();
+
+        let loaded = load_persisted(repo_root, "main__feature").unwrap().unwrap();
+        assert_eq!(loaded.files.len(), 2);
+
+        assert_eq!(loaded.files[0].path, "src/lib.rs");
+        assert_eq!(loaded.files[0].state, PersistedState::Reviewed);
+        assert_eq!(loaded.files[0].blob_a, Some(oid("aa")));
+
+        assert_eq!(loaded.files[1].path, "src/main.rs");
+        assert_eq!(loaded.files[1].state, PersistedState::Unreviewed);
     }
-
-    Ok(files)
-}
-
-fn resolve_tree<'repo>(repo: &'repo Repository, git_ref: &str) -> Result<git2::Tree<'repo>> {
-    let obj = repo.revparse_single(git_ref)?;
-    Ok(obj.peel_to_tree()?)
-}
-
-fn non_zero_oid(oid: Oid) -> Option<Oid> {
-    if oid.is_zero() { None } else { Some(oid) }
 }
