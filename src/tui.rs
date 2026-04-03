@@ -19,14 +19,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{Block, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 
 use crate::checklist::Checklist;
-use crate::clipboard;
 use crate::git::FileStatus;
+use crate::open_command;
 use crate::session::ReviewState;
+use crate::theme::Theme;
 
 const BRAILLE_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -48,9 +49,11 @@ impl Tui {
         checklist: &mut Checklist,
         repo_root: &Path,
         diff_tool: &str,
+        initial_theme: Theme,
         worktree_a: &Path,
         worktree_b: &Path,
     ) -> Result<()> {
+        let mut theme = initial_theme;
         let mut available_height = self.terminal.size()?.height.saturating_sub(3);
         let mut split_row = default_split(available_height);
         let mut dragging = false;
@@ -58,6 +61,9 @@ impl Tui {
         let mut cached: HashMap<usize, Text<'static>> = HashMap::new();
         let mut spinner_frame: u8 = 0;
         let mut last_selected: Option<usize> = None;
+        let mut preview_scroll: usize = 0;
+        let mut notification: Option<(String, std::time::Instant)> = None;
+        let mut last_refresh = std::time::Instant::now();
 
         let file_paths: Vec<(PathBuf, PathBuf)> = checklist
             .session
@@ -67,7 +73,7 @@ impl Tui {
             .collect();
 
         let mut width = self.terminal.size()?.width.saturating_sub(1);
-        let worker = DiffWorker::start(work_items(&file_paths, diff_tool, width));
+        let worker = DiffWorker::start(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
 
         loop {
             let total = checklist.session.files.len();
@@ -79,6 +85,8 @@ impl Tui {
 
             if total > 0 && last_selected != Some(checklist.selected) {
                 last_selected = Some(checklist.selected);
+                preview_scroll = 0;
+                notification = None;
                 if !cached.contains_key(&checklist.selected) {
                     worker.prioritize(checklist.selected);
                 }
@@ -90,28 +98,63 @@ impl Tui {
             }
 
             let preview = cached.get(&checklist.selected);
-            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, split_row)?;
+            let active_notif = active_notification(&notification);
+            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, preview_scroll, split_row, active_notif, &theme)?;
+
+            if last_refresh.elapsed() >= std::time::Duration::from_secs(30) {
+                checklist.refresh(repo_root)?;
+                checklist.session.save(repo_root)?;
+                last_refresh = std::time::Instant::now();
+                cached.clear();
+                last_selected = None;
+                worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+            }
 
             match self.next_checklist_event(checklist, split_row, &mut dragging, !all_done)? {
                 ChecklistControl::Continue => {}
                 ChecklistControl::Save => checklist.session.save(repo_root)?,
+                ChecklistControl::Refresh => {
+                    checklist.refresh(repo_root)?;
+                    checklist.session.save(repo_root)?;
+                    last_refresh = std::time::Instant::now();
+                    cached.clear();
+                    last_selected = None;
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+                }
+                ChecklistControl::CycleTheme => {
+                    theme = theme.next();
+                    cached.clear();
+                    last_selected = None;
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+                }
                 ChecklistControl::OpenDiff => {
                     if let Some(file) = checklist.selected_file() {
                         let path_a = worktree_a.join(&file.path);
                         let path_b = worktree_b.join(&file.path);
                         let label = file.path.display().to_string();
                         let initial = cached.get(&checklist.selected).cloned();
-                        self.run_diff_view(diff_tool, &path_a, &path_b, &label, initial)?;
+                        preview_scroll = self.run_diff_view(
+                            &diff_tool, &theme, &path_a, &path_b, &label,
+                            initial, preview_scroll,
+                        )?;
                     }
                 }
                 ChecklistControl::CopyPathNew => {
                     if let Some(file) = checklist.selected_file() {
-                        clipboard::copy_open_command(&worktree_b.join(&file.path), 1);
+                        let mut msg = open_command::copy(&worktree_b.join(&file.path), 1);
+                        if crate::worktree::is_managed(worktree_b, repo_root) {
+                            msg.push_str("  ⚠ grit-managed worktree — edits will be lost on exit");
+                        }
+                        notification = Some((msg, std::time::Instant::now()));
                     }
                 }
                 ChecklistControl::CopyPathOld => {
                     if let Some(file) = checklist.selected_file() {
-                        clipboard::copy_open_command(&worktree_a.join(&file.path), 1);
+                        let mut msg = open_command::copy(&worktree_a.join(&file.path), 1);
+                        if crate::worktree::is_managed(worktree_a, repo_root) {
+                            msg.push_str("  ⚠ grit-managed worktree — edits will be lost on exit");
+                        }
+                        notification = Some((msg, std::time::Instant::now()));
                     }
                 }
                 ChecklistControl::Quit => {
@@ -121,6 +164,12 @@ impl Tui {
                 ChecklistControl::AdjustSplit(delta) => {
                     let max = available_height.saturating_sub(2);
                     split_row = (split_row as i32 + delta).clamp(2, max as i32) as u16;
+                }
+                ChecklistControl::ScrollPreview(delta) => {
+                    if let Some(text) = cached.get(&checklist.selected) {
+                        let max = text.lines.len().saturating_sub(1);
+                        preview_scroll = (preview_scroll as i32 + delta).clamp(0, max as i32) as usize;
+                    }
                 }
                 ChecklistControl::UpdateDrag(row) => {
                     // row is the terminal row the cursor is on; title bar occupies row 0
@@ -141,7 +190,7 @@ impl Tui {
                     width = size.width.saturating_sub(1);
                     cached.clear();
                     last_selected = None;
-                    worker.reset(work_items(&file_paths, diff_tool, width));
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
                 }
             }
         }
@@ -150,20 +199,23 @@ impl Tui {
     fn run_diff_view(
         &mut self,
         diff_tool: &str,
+        theme: &Theme,
         path_a: &Path,
         path_b: &Path,
         label: &str,
         initial: Option<Text<'static>>,
-    ) -> Result<()> {
+        initial_scroll: usize,
+    ) -> Result<usize> {
         let width = self.terminal.size()?.width;
         let mut text = match initial {
             Some(t) => t,
             None => capture_diff(diff_tool, path_a, path_b, width)?,
         };
-        let mut scroll: usize = 0;
+        let mut scroll = initial_scroll;
+        let mut notification: Option<(String, std::time::Instant)> = None;
 
         loop {
-            self.render_diff(&text, scroll, label)?;
+            self.render_diff(&text, scroll, label, active_notification(&notification), theme)?;
             match self.next_diff_event(&text, &mut scroll)? {
                 DiffControl::Continue => {}
                 DiffControl::Resize => {
@@ -171,7 +223,15 @@ impl Tui {
                     text = capture_diff(diff_tool, path_a, path_b, new_width)?;
                     scroll = 0;
                 }
-                DiffControl::Exit => return Ok(()),
+                DiffControl::CopyPathNew => {
+                    let msg = open_command::copy(path_b, (scroll + 1) as u32);
+                    notification = Some((msg, std::time::Instant::now()));
+                }
+                DiffControl::CopyPathOld => {
+                    let msg = open_command::copy(path_a, (scroll + 1) as u32);
+                    notification = Some((msg, std::time::Instant::now()));
+                }
+                DiffControl::Exit => return Ok(scroll),
             }
         }
     }
@@ -182,7 +242,10 @@ impl Tui {
         list_state: &mut ListState,
         preview: Option<&Text<'static>>,
         spinner_frame: u8,
+        preview_scroll: usize,
         split_row: u16,
+        notification: Option<&str>,
+        theme: &Theme,
     ) -> Result<()> {
         let session = &checklist.session;
         let total = session.files.len();
@@ -190,6 +253,7 @@ impl Tui {
 
         self.terminal.draw(|frame| {
             let area = frame.area();
+            frame.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -202,7 +266,7 @@ impl Tui {
                 .split(area);
 
             let title_bar = Paragraph::new(title_bar_text(&session.ref_a, &session.ref_b, vertical[0].width))
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                .style(theme.title_bar);
             frame.render_widget(title_bar, vertical[0]);
 
             // File list with scroll-indicator column.
@@ -222,12 +286,13 @@ impl Tui {
                     let checkbox = match f.state {
                         ReviewState::Unreviewed => "[ ]",
                         ReviewState::ReviewedStable => "[x]",
+                        ReviewState::ReviewedDirty => "[~]",
                     };
                     let (status_char, status_style) = match f.status {
-                        FileStatus::Added    => ("A", Style::default().fg(Color::Green)),
-                        FileStatus::Deleted  => ("D", Style::default().fg(Color::Red)),
-                        FileStatus::Modified => ("M", Style::default().fg(Color::Yellow)),
-                        FileStatus::Moved    => ("R", Style::default().fg(Color::Cyan)),
+                        FileStatus::Added    => ("A", theme.status_added),
+                        FileStatus::Deleted  => ("D", theme.status_deleted),
+                        FileStatus::Modified => ("M", theme.status_modified),
+                        FileStatus::Moved    => ("R", theme.status_moved),
                     };
                     let add_str = format!("+{}", f.additions);
                     let del_str = format!("-{}", f.deletions);
@@ -235,9 +300,9 @@ impl Tui {
                         Span::raw(format!(" {checkbox} ")),
                         Span::styled(status_char, status_style),
                         Span::raw("  "),
-                        Span::styled(format!("{:>count_width$}", add_str), count_style(f.additions, true)),
+                        Span::styled(format!("{:>count_width$}", add_str), count_style(f.additions, theme.count_positive, theme.count_positive_bg)),
                         Span::raw("  "),
-                        Span::styled(format!("{:>count_width$}", del_str), count_style(f.deletions, false)),
+                        Span::styled(format!("{:>count_width$}", del_str), count_style(f.deletions, theme.count_negative, theme.count_negative_bg)),
                         Span::raw(format!("  {}", f.path.display())),
                     ];
                     if let FileStatus::Moved = f.status {
@@ -252,12 +317,7 @@ impl Tui {
                 })
                 .collect();
 
-            let list = List::new(items).highlight_style(
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            );
+            let list = List::new(items).highlight_style(theme.list_highlight);
             frame.render_stateful_widget(list, list_chunks[0], list_state);
 
             let list_height = list_chunks[0].height as usize;
@@ -268,11 +328,11 @@ impl Tui {
 
             // Divider — left label for preview, right label for resize hint.
             let left = "─── Preview · Enter to expand ";
-            let right = " =/- resize ───";
+            let right = " -/= resize ───";
             let fill_len = (area.width as usize)
                 .saturating_sub(left.chars().count() + right.chars().count());
             let divider = Paragraph::new(format!("{left}{}{right}", "─".repeat(fill_len)))
-                .style(Style::default().fg(Color::DarkGray));
+                .style(theme.divider);
             frame.render_widget(divider, vertical[2]);
 
             // Preview with scroll-indicator column.
@@ -282,11 +342,14 @@ impl Tui {
                 .split(vertical[3]);
 
             if let Some(text) = &preview {
-                frame.render_widget(Paragraph::new(text.clone()), preview_chunks[0]);
+                frame.render_widget(
+                    Paragraph::new(text.clone()).scroll((preview_scroll as u16, 0)),
+                    preview_chunks[0],
+                );
                 let preview_height = preview_chunks[0].height as usize;
-                let has_more = text.lines.len() > preview_height;
-                let preview_indicator =
-                    scroll_indicator(false, has_more, preview_chunks[1].height);
+                let above = preview_scroll > 0;
+                let below = preview_scroll + preview_height < text.lines.len();
+                let preview_indicator = scroll_indicator(above, below, preview_chunks[1].height);
                 frame.render_widget(Paragraph::new(preview_indicator), preview_chunks[1]);
             } else if total > 0 {
                 let spinner = BRAILLE_FRAMES[spinner_frame as usize];
@@ -296,34 +359,49 @@ impl Tui {
                 );
             }
 
-            let footer = Paragraph::new(
-                " j/k navigate   r toggle reviewed   y/Y copy path (new/old)",
-            )
-            .style(Style::default().bg(Color::DarkGray).fg(Color::Gray));
-            frame.render_widget(footer, vertical[4]);
+            let footer_text = notification.unwrap_or(
+                " u/i navigate   j/k scroll preview   r toggle reviewed   y/Y copy path (new/old)",
+            );
+            let footer_style = if notification.is_some() {
+                theme.footer_notification
+            } else {
+                theme.footer
+            };
+            frame.render_widget(
+                Paragraph::new(format!(" {footer_text}")).style(footer_style),
+                vertical[4],
+            );
         })?;
 
         Ok(())
     }
 
-    fn render_diff(&mut self, text: &Text<'static>, scroll: usize, label: &str) -> Result<()> {
+    fn render_diff(&mut self, text: &Text<'static>, scroll: usize, label: &str, notification: Option<&str>, theme: &Theme) -> Result<()> {
         self.terminal.draw(|frame| {
             let area = frame.area();
+            frame.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
                 .split(area);
 
             let title_bar = Paragraph::new(format!(" {label}"))
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                .style(theme.title_bar);
             frame.render_widget(title_bar, chunks[0]);
 
             let diff_view = Paragraph::new(text.clone()).scroll((scroll as u16, 0));
             frame.render_widget(diff_view, chunks[1]);
 
-            let footer = Paragraph::new(" j/k scroll   Enter/Esc/q return")
-                .style(Style::default().bg(Color::DarkGray).fg(Color::Gray));
-            frame.render_widget(footer, chunks[2]);
+            let footer_text = notification.unwrap_or(" j/k scroll   y/Y open (new/old)   o config   Enter/Esc/q return");
+            let footer_style = if notification.is_some() {
+                theme.footer_notification
+            } else {
+                theme.footer
+            };
+            frame.render_widget(
+                Paragraph::new(format!(" {footer_text}")).style(footer_style),
+                chunks[2],
+            );
         })?;
 
         Ok(())
@@ -378,6 +456,8 @@ struct WorkItem {
     path_b: PathBuf,
     diff_tool: String,
     width: u16,
+    diff_added: Color,
+    diff_deleted: Color,
 }
 
 struct DiffWorker {
@@ -395,7 +475,7 @@ impl DiffWorker {
                 let item = worker_queue.lock().expect("diff queue lock poisoned").pop_front();
                 match item {
                     Some(item) => {
-                        let text = capture_diff(&item.diff_tool, &item.path_a, &item.path_b, item.width)
+                        let text = capture_diff(&item.diff_tool, &item.path_a, &item.path_b, item.width, item.diff_added, item.diff_deleted)
                             .unwrap_or_default();
                         if tx.send((item.index, text)).is_err() {
                             break;
@@ -421,7 +501,7 @@ impl DiffWorker {
     }
 }
 
-fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16) -> VecDeque<WorkItem> {
+fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16, diff_added: Color, diff_deleted: Color) -> VecDeque<WorkItem> {
     file_paths
         .iter()
         .enumerate()
@@ -431,6 +511,8 @@ fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16) ->
             path_b: path_b.clone(),
             diff_tool: diff_tool.to_string(),
             width,
+            diff_added,
+            diff_deleted,
         })
         .collect()
 }
@@ -438,11 +520,14 @@ fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16) ->
 enum ChecklistControl {
     Continue,
     Save,
+    Refresh,
+    CycleTheme,
     OpenDiff,
     CopyPathNew,
     CopyPathOld,
     Quit,
     AdjustSplit(i32),
+    ScrollPreview(i32),
     UpdateDrag(u16),
     Resize,
 }
@@ -450,6 +535,8 @@ enum ChecklistControl {
 enum DiffControl {
     Continue,
     Resize,
+    CopyPathNew,
+    CopyPathOld,
     Exit,
 }
 
@@ -482,18 +569,20 @@ fn scroll_indicator(above: bool, below: bool, height: u16) -> Text<'static> {
     Text::from(lines)
 }
 
-fn count_style(count: u32, positive: bool) -> Style {
-    let fg = if positive { Color::Green } else { Color::Red };
-    let bg = if positive { Color::Rgb(0, 80, 0) } else { Color::Rgb(80, 0, 0) };
+fn count_style(count: u32, fg: Color, heavy_bg: Color) -> Style {
     match count {
         0         => Style::default().fg(fg).add_modifier(Modifier::DIM),
         1..=99    => Style::default().fg(fg),
         100..=999 => Style::default().fg(fg).add_modifier(Modifier::BOLD),
-        _         => Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        _         => Style::default().fg(fg).bg(heavy_bg).add_modifier(Modifier::BOLD),
     }
 }
 
-fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16) -> Result<Text<'static>> {
+fn active_notification(notification: &Option<(String, std::time::Instant)>) -> Option<&str> {
+    notification.as_ref().map(|(s, _)| s.as_str())
+}
+
+fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16, diff_added: Color, diff_deleted: Color) -> Result<Text<'static>> {
     let null = Path::new("/dev/null");
     let mut parts = diff_tool.split_whitespace();
     let bin = parts.next().unwrap_or(diff_tool);
@@ -507,7 +596,7 @@ fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16) -> Re
         .stdout(Stdio::piped())
         .output()?;
 
-    Ok(crate::ansi::parse(&output.stdout))
+    Ok(crate::ansi::parse(&output.stdout, diff_added, diff_deleted))
 }
 
 fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistControl {
@@ -516,11 +605,11 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ChecklistControl::Quit
         }
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Char('u') | KeyCode::Down => {
             checklist.select_next();
             ChecklistControl::Continue
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Char('i') | KeyCode::Up => {
             checklist.select_prev();
             ChecklistControl::Continue
         }
@@ -528,11 +617,15 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
             checklist.toggle_reviewed();
             ChecklistControl::Save
         }
+        KeyCode::Char('R') => ChecklistControl::Refresh,
+        KeyCode::Char('t') => ChecklistControl::CycleTheme,
         KeyCode::Enter => ChecklistControl::OpenDiff,
         KeyCode::Char('y') => ChecklistControl::CopyPathNew,
         KeyCode::Char('Y') => ChecklistControl::CopyPathOld,
-        KeyCode::Char('=') => ChecklistControl::AdjustSplit(1),
-        KeyCode::Char('-') => ChecklistControl::AdjustSplit(-1),
+        KeyCode::Char('=') => ChecklistControl::AdjustSplit(-1),
+        KeyCode::Char('-') => ChecklistControl::AdjustSplit(1),
+        KeyCode::Char('j') => ChecklistControl::ScrollPreview(1),
+        KeyCode::Char('k') => ChecklistControl::ScrollPreview(-1),
         _ => ChecklistControl::Continue,
     }
 }
@@ -550,6 +643,8 @@ fn handle_diff_key(key: KeyEvent, text: &Text<'static>, scroll: &mut usize) -> D
             *scroll = scroll.saturating_sub(1);
             DiffControl::Continue
         }
+        KeyCode::Char('y') => DiffControl::CopyPathNew,
+        KeyCode::Char('Y') => DiffControl::CopyPathOld,
         _ => DiffControl::Continue,
     }
 }

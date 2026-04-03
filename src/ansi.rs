@@ -7,13 +7,16 @@ use ratatui::{
 ///
 /// Only SGR sequences are handled (colors, bold, reset) — the subset difft
 /// outputs. All other escape sequences are stripped silently.
-pub(crate) fn parse(bytes: &[u8]) -> Text<'static> {
+pub(crate) fn parse(bytes: &[u8], diff_added: Color, diff_deleted: Color) -> Text<'static> {
     let raw = String::from_utf8_lossy(bytes);
-    let lines: Vec<Line<'static>> = raw.split('\n').map(parse_line).collect();
+    let lines: Vec<Line<'static>> = raw
+        .split('\n')
+        .map(|line| parse_line(line, diff_added, diff_deleted))
+        .collect();
     Text::from(lines)
 }
 
-fn parse_line(line: &str) -> Line<'static> {
+fn parse_line(line: &str, diff_added: Color, diff_deleted: Color) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut style = Style::default();
     let mut remaining = line;
@@ -29,7 +32,7 @@ fn parse_line(line: &str) -> Line<'static> {
             // Try to consume an SGR sequence: ESC [ ... m
             if let Some(seq_end) = parse_sgr(remaining) {
                 let params = &remaining[2..seq_end]; // between '[' and 'm'
-                style = apply_sgr(style, params);
+                style = apply_sgr(style, params, diff_added, diff_deleted);
                 remaining = &remaining[seq_end + 1..];
             } else {
                 // Not a recognised sequence — skip the ESC byte and continue.
@@ -61,7 +64,7 @@ fn parse_sgr(s: &str) -> Option<usize> {
     }
 }
 
-fn apply_sgr(base: Style, params: &str) -> Style {
+fn apply_sgr(base: Style, params: &str, diff_added: Color, diff_deleted: Color) -> Style {
     let codes: Vec<u8> = params
         .split(';')
         .filter(|s| !s.is_empty())
@@ -80,7 +83,7 @@ fn apply_sgr(base: Style, params: &str) -> Style {
             4 => style = style.add_modifier(Modifier::UNDERLINED),
             9 => style = style.add_modifier(Modifier::CROSSED_OUT),
             // Standard foreground colours.
-            30..=37 => style = style.fg(ansi_color(codes[i] - 30, false)),
+            30..=37 => style = style.fg(remap(ansi_color(codes[i] - 30, false), diff_added, diff_deleted)),
             38 if codes.get(i + 1) == Some(&5) => {
                 if let Some(&n) = codes.get(i + 2) {
                     style = style.fg(Color::Indexed(n));
@@ -97,7 +100,7 @@ fn apply_sgr(base: Style, params: &str) -> Style {
             }
             39 => style = style.fg(Color::Reset),
             // Standard background colours.
-            40..=47 => style = style.bg(ansi_color(codes[i] - 40, false)),
+            40..=47 => style = style.bg(remap(ansi_color(codes[i] - 40, false), diff_added, diff_deleted)),
             48 if codes.get(i + 1) == Some(&5) => {
                 if let Some(&n) = codes.get(i + 2) {
                     style = style.bg(Color::Indexed(n));
@@ -114,15 +117,23 @@ fn apply_sgr(base: Style, params: &str) -> Style {
             }
             49 => style = style.bg(Color::Reset),
             // Bright foreground colours.
-            90..=97 => style = style.fg(ansi_color(codes[i] - 90, true)),
+            90..=97 => style = style.fg(remap(ansi_color(codes[i] - 90, true), diff_added, diff_deleted)),
             // Bright background colours.
-            100..=107 => style = style.bg(ansi_color(codes[i] - 100, true)),
+            100..=107 => style = style.bg(remap(ansi_color(codes[i] - 100, true), diff_added, diff_deleted)),
             _ => {}
         }
         i += 1;
     }
 
     style
+}
+
+fn remap(color: Color, diff_added: Color, diff_deleted: Color) -> Color {
+    match color {
+        Color::Green | Color::LightGreen => diff_added,
+        Color::Red   | Color::LightRed   => diff_deleted,
+        other => other,
+    }
 }
 
 fn ansi_color(index: u8, bright: bool) -> Color {

@@ -22,6 +22,7 @@ Configuration is read from `.grit.toml` at the repository root. All fields are o
 
 ```toml
 diff_tool = "difft --color always"  # default: difft --color always
+theme = "autumn"                    # available: default, autumn; default: autumn
 ```
 
 ## Behaviour
@@ -32,7 +33,7 @@ A session is the pairing of two refs. State is stored in `.grit/` at the reposit
 
 ### Worktree Management
 
-For each git ref, `grit` creates a worktree at `.grit/worktrees/<ref-sanitised>/` on session start and removes it on clean exit. Before removing a worktree, `grit` checks for uncommitted changes or unpushed commits; if either are present, the user is warned and prompted to confirm before removal. Unclean exits leave worktrees in place for reuse. The working tree ref (`.`) uses the repository's actual working directory — no worktree is created.
+For each git ref, `grit` creates a worktree at `.grit/worktrees/<ref-a-sanitised>__<ref-b-sanitised>/<ref-sanitised>/` on session start and removes it on clean exit. The session-scoped directory prevents concurrent sessions sharing a ref from colliding on worktree paths. The working tree ref (`.`) sanitises to `working-tree`. Before removing a worktree, `grit` checks for uncommitted changes or unpushed commits; if either are present, the user is warned and prompted to confirm before removal. Unclean exits leave worktrees in place for reuse. The working tree ref (`.`) uses the repository's actual working directory — no worktree is created within the session directory.
 
 ### File Checklist
 
@@ -42,14 +43,18 @@ Files differing between the two refs are listed with one of three states:
 - **Reviewed, stable** — blob hashes on both sides match those recorded at review time
 - **Reviewed, dirty** — reviewed, but at least one side is the working tree with uncommitted changes
 
+Toggling an unreviewed file always produces **reviewed, stable** regardless of dirty status. The dirty overlay is applied by the diff/merge logic at load and refresh time only — it is never set directly by a toggle.
+
 Each row shows a status column, line-change counts, and the file path:
 
 ```
  [x] M  +123   -45  src/main.rs
  [ ] A    +8    -0  src/lib.rs
- [x] D    +0  -200  src/old.rs
+ [~] D    +0  -200  src/old.rs
  [ ] R    +3    -1  src/new.rs  (was: src/old_name.rs)
 ```
+
+Checkbox characters: `[ ]` unreviewed, `[x]` reviewed stable, `[~]` reviewed dirty.
 
 Status characters: `A` added (green), `D` deleted (red), `M` modified (yellow), `R` renamed/moved (cyan). Line counts are right-aligned and colour-coded green (`+`) and red (`-`), with intensity scaling by magnitude: dim for zero, normal for 1–99, bold for 100–999, bold with coloured background for 1000+. Renamed files append `(was: <old_path>)` in dim style.
 
@@ -73,7 +78,7 @@ The divider between the file list and preview panes can be repositioned:
 
 ### Progress Persistence
 
-Per-file state records the blob hashes on both sides at review time, written to `.grit/<session-id>/state.toml`.
+Per-file state records the blob hashes on both sides at review time, written to `.grit/sessions/<session-id>/state.toml`.
 
 ### Refresh
 
@@ -84,15 +89,11 @@ On refresh, `grit` recomputes the diff:
 - New files are added as **unreviewed**
 - Files no longer in the diff are removed
 
-### Clipboard Bridge
+Refresh is triggered manually with `R` or automatically every 30 seconds. After each refresh the session is saved to disk.
 
-From the checklist or diff view, the user can copy a ready-to-paste editor command:
+### Clipboard
 
-```
-:open /absolute/path/to/worktree/src/file.rs:42
-```
-
-The path targets the chosen worktree side: `y` copies the `ref_b` (new) path; `Y` copies the `ref_a` (old) path. The line number reflects the diff view position, or 1 when invoked from the checklist. The command is written to the clipboard via OSC 52.
+From the checklist or diff view, `y` copies `path:line` for the `ref_b` (new) side to the clipboard via OSC 52; `Y` copies for the `ref_a` (old) side. The line number reflects the current scroll position in the diff view, or 1 when invoked from the checklist. A brief confirmation appears in the footer. If the copied path resolves into a grit-managed worktree (`.grit/worktrees/…`), the confirmation is appended with a warning that edits there will be lost on exit.
 
 ### Navigation
 
@@ -102,14 +103,18 @@ Checklist keyboard bindings:
 
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Select next file |
-| `k` / `↑` | Select previous file |
+| `u` / `↓` | Select next file |
+| `i` / `↑` | Select previous file |
+| `j` | Scroll preview down |
+| `k` | Scroll preview up |
 | `Enter` | Promote preview to fullscreen diff |
 | `r` / `Space` | Toggle reviewed state |
-| `y` | Copy `:open <path>:<line>` for `ref_b` (new) to clipboard |
-| `Y` | Copy `:open <path>:<line>` for `ref_a` (old) to clipboard |
-| `=` | Grow file list (move divider down) |
-| `-` | Shrink file list (move divider up) |
+| `R` | Refresh (recompute diff) |
+| `t` | Cycle theme |
+| `y` | Copy `path:line` for `ref_b` (new) to clipboard |
+| `Y` | Copy `path:line` for `ref_a` (old) to clipboard |
+| `=` | Shrink file list (move divider up) |
+| `-` | Grow file list (move divider down) |
 | `Esc` / `q` / `Ctrl-C` | Quit |
 
 `h` and `l` are not bound — the checklist is a single column so horizontal movement has no meaning.
@@ -120,6 +125,8 @@ Fullscreen diff keyboard bindings:
 |-----|--------|
 | `j` / `↓` | Scroll down |
 | `k` / `↑` | Scroll up |
+| `y` | Copy `path:line` for `ref_b` (new) to clipboard |
+| `Y` | Copy `path:line` for `ref_a` (old) to clipboard |
 | `Enter` / `q` / `Esc` / `Ctrl-C` | Return to checklist |
 
 ## Constraints
@@ -138,7 +145,8 @@ Fullscreen diff keyboard bindings:
 - Review state survives exit and restores correctly on next invocation
 - After a ref advances: unchanged files stay ticked, changed files reset to unreviewed
 - A reviewed file with uncommitted working tree changes shows as reviewed, dirty
-- Clipboard command targets the correct worktree for the active side
+- `y`/`Y` writes `path:line` via OSC 52 and shows confirmation in footer
+- `y`/`Y` in diff view uses the current scroll line, not 1
 - Diff tool not on PATH → clear error before TUI opens
 - Exiting with a worktree containing uncommitted changes → user is warned and prompted before removal
 - Exiting with a worktree containing unpushed commits → user is warned and prompted before removal

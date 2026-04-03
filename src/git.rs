@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,7 +70,27 @@ pub(crate) fn diff_files(
     Ok(entries)
 }
 
+pub(crate) fn dirty_paths(repo_root: &Path) -> Result<HashSet<PathBuf>> {
+    let output = Command::new("git")
+        .args(["diff-index", "--name-only", "HEAD"])
+        .current_dir(repo_root)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git failed: {stderr}");
+    }
+
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| eyre!("git returned non-UTF-8 output"))?;
+
+    Ok(stdout.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+}
+
 pub(crate) fn sanitise_ref(git_ref: &str) -> String {
+    if git_ref == "." {
+        return "working-tree".to_string();
+    }
     git_ref.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '], "-")
 }
 

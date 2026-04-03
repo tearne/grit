@@ -8,10 +8,16 @@ use serde::Deserialize;
 pub(crate) struct Config {
     #[serde(default = "default_diff_tool")]
     pub(crate) diff_tool: String,
+    #[serde(default = "default_theme")]
+    pub(crate) theme: String,
 }
 
 fn default_diff_tool() -> String {
     "difft --color always".to_string()
+}
+
+fn default_theme() -> String {
+    "autumn".to_string()
 }
 
 impl Config {
@@ -21,7 +27,7 @@ impl Config {
             let raw = std::fs::read_to_string(&path)?;
             toml::from_str(&raw)?
         } else {
-            Config { diff_tool: default_diff_tool() }
+            Config { diff_tool: default_diff_tool(), theme: default_theme() }
         };
         config.validate()?;
         Ok(config)

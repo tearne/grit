@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::Result;
@@ -31,6 +32,7 @@ pub(crate) struct FileEntry {
 pub(crate) enum ReviewState {
     Unreviewed,
     ReviewedStable,
+    ReviewedDirty,
 }
 
 impl Session {
@@ -42,8 +44,25 @@ impl Session {
         let id = session_id(ref_a, ref_b);
         let current_files = git::diff_files(repo_root, ref_a, ref_b)?;
         let persisted = load_persisted(repo_root, &id)?;
-        let files = merge_state(current_files, persisted);
+        let dirty = if ref_a == "." || ref_b == "." {
+            git::dirty_paths(repo_root)?
+        } else {
+            HashSet::new()
+        };
+        let files = merge_state(current_files, persisted, &dirty);
         Ok(Session { id, ref_a: ref_a.to_string(), ref_b: ref_b.to_string(), files })
+    }
+
+    pub(crate) fn refresh(&mut self, repo_root: &Path) -> Result<()> {
+        let snapshot = self.to_persisted();
+        let current_files = git::diff_files(repo_root, &self.ref_a, &self.ref_b)?;
+        let dirty = if self.ref_a == "." || self.ref_b == "." {
+            git::dirty_paths(repo_root)?
+        } else {
+            HashSet::new()
+        };
+        self.files = merge_state(current_files, Some(snapshot), &dirty);
+        Ok(())
     }
 
     pub(crate) fn save(&self, repo_root: &Path) -> Result<()> {
@@ -60,7 +79,7 @@ impl Session {
                 path: f.path.to_string_lossy().into_owned(),
                 state: match f.state {
                     ReviewState::Unreviewed => PersistedState::Unreviewed,
-                    ReviewState::ReviewedStable => PersistedState::Reviewed,
+                    ReviewState::ReviewedStable | ReviewState::ReviewedDirty => PersistedState::Reviewed,
                 },
                 blob_a: f.blob_a.clone(),
                 blob_b: f.blob_b.clone(),
@@ -102,7 +121,7 @@ fn session_id(ref_a: &str, ref_b: &str) -> String {
 }
 
 fn session_dir(repo_root: &Path, id: &str) -> PathBuf {
-    repo_root.join(".grit").join(id)
+    repo_root.join(".grit").join("sessions").join(id)
 }
 
 fn load_persisted(repo_root: &Path, id: &str) -> Result<Option<PersistedSession>> {
@@ -117,10 +136,12 @@ fn load_persisted(repo_root: &Path, id: &str) -> Result<Option<PersistedSession>
 fn merge_state(
     current: Vec<git::DiffEntry>,
     persisted: Option<PersistedSession>,
+    dirty: &HashSet<PathBuf>,
 ) -> Vec<FileEntry> {
     let persisted = persisted.unwrap_or(PersistedSession { files: vec![] });
 
     current.into_iter().map(|entry| {
+        let is_dirty = dirty.contains(&entry.path);
         let state = persisted.files.iter()
             .find(|f| Path::new(&f.path) == entry.path)
             .and_then(|f| {
@@ -128,7 +149,11 @@ fn merge_state(
                     && entry.blob_a == f.blob_a
                     && entry.blob_b == f.blob_b
                 {
-                    Some(ReviewState::ReviewedStable)
+                    if is_dirty {
+                        Some(ReviewState::ReviewedDirty)
+                    } else {
+                        Some(ReviewState::ReviewedStable)
+                    }
                 } else {
                     None
                 }
@@ -150,6 +175,7 @@ fn merge_state(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use super::{
@@ -174,6 +200,17 @@ mod tests {
         }
     }
 
+    fn reviewed_persisted(path: &str, blob_a: &str, blob_b: &str) -> PersistedSession {
+        PersistedSession {
+            files: vec![PersistedFile {
+                path: path.into(),
+                state: PersistedState::Reviewed,
+                blob_a: Some(oid(blob_a)),
+                blob_b: Some(oid(blob_b)),
+            }],
+        }
+    }
+
     // --- session_id ---
 
     #[test]
@@ -195,35 +232,21 @@ mod tests {
 
     #[test]
     fn merge_state_no_persisted_all_unreviewed() {
-        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], None);
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], None, &HashSet::new());
         assert_eq!(entries[0].state, ReviewState::Unreviewed);
     }
 
     #[test]
     fn merge_state_reviewed_stable_survives_matching_blobs() {
-        let persisted = Some(PersistedSession {
-            files: vec![PersistedFile {
-                path: "a.rs".into(),
-                state: PersistedState::Reviewed,
-                blob_a: Some(oid("aa")),
-                blob_b: Some(oid("bb")),
-            }],
-        });
-        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], persisted);
+        let persisted = Some(reviewed_persisted("a.rs", "aa", "bb"));
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], persisted, &HashSet::new());
         assert_eq!(entries[0].state, ReviewState::ReviewedStable);
     }
 
     #[test]
     fn merge_state_blob_mismatch_resets_to_unreviewed() {
-        let persisted = Some(PersistedSession {
-            files: vec![PersistedFile {
-                path: "a.rs".into(),
-                state: PersistedState::Reviewed,
-                blob_a: Some(oid("aa")),
-                blob_b: Some(oid("bb")), // old blob
-            }],
-        });
-        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("cc")))], persisted);
+        let persisted = Some(reviewed_persisted("a.rs", "aa", "bb"));
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("cc")))], persisted, &HashSet::new());
         assert_eq!(entries[0].state, ReviewState::Unreviewed);
     }
 
@@ -232,6 +255,7 @@ mod tests {
         let entries = merge_state(
             vec![entry("new.rs", Some(oid("aa")), Some(oid("bb")))],
             Some(PersistedSession { files: vec![] }),
+            &HashSet::new(),
         );
         assert_eq!(entries[0].state, ReviewState::Unreviewed);
     }
@@ -246,8 +270,23 @@ mod tests {
                 blob_b: None,
             }],
         });
-        let entries = merge_state(vec![], persisted);
+        let entries = merge_state(vec![], persisted, &HashSet::new());
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn merge_state_yields_reviewed_dirty_for_reviewed_file_in_dirty_set() {
+        let persisted = Some(reviewed_persisted("a.rs", "aa", "bb"));
+        let dirty = HashSet::from([PathBuf::from("a.rs")]);
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], persisted, &dirty);
+        assert_eq!(entries[0].state, ReviewState::ReviewedDirty);
+    }
+
+    #[test]
+    fn merge_state_yields_reviewed_stable_for_reviewed_file_not_in_dirty_set() {
+        let persisted = Some(reviewed_persisted("a.rs", "aa", "bb"));
+        let entries = merge_state(vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))], persisted, &HashSet::new());
+        assert_eq!(entries[0].state, ReviewState::ReviewedStable);
     }
 
     // --- Session::save + load_persisted round-trip ---
@@ -265,6 +304,7 @@ mod tests {
                 super::FileEntry {
                     path: PathBuf::from("src/lib.rs"),
                     state: ReviewState::ReviewedStable,
+
                     blob_a: Some(oid("aa")),
                     blob_b: Some(oid("bb")),
                     status: FileStatus::Modified,
@@ -275,6 +315,7 @@ mod tests {
                 super::FileEntry {
                     path: PathBuf::from("src/main.rs"),
                     state: ReviewState::Unreviewed,
+
                     blob_a: Some(oid("cc")),
                     blob_b: Some(oid("dd")),
                     status: FileStatus::Added,
@@ -296,5 +337,83 @@ mod tests {
 
         assert_eq!(loaded.files[1].path, "src/main.rs");
         assert_eq!(loaded.files[1].state, PersistedState::Unreviewed);
+    }
+
+    // --- refresh behaviour (via to_persisted snapshot + merge_state) ---
+
+    fn reviewed_stable_entry(path: &str, ba: &str, bb: &str) -> super::FileEntry {
+        super::FileEntry {
+            path: PathBuf::from(path),
+            state: ReviewState::ReviewedStable,
+            blob_a: Some(oid(ba)),
+            blob_b: Some(oid(bb)),
+            status: FileStatus::Modified,
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    fn snapshot(files: &[super::FileEntry]) -> PersistedSession {
+        let s = Session {
+            id: "t".into(),
+            ref_a: "a".into(),
+            ref_b: "b".into(),
+            files: files.iter().map(|f| super::FileEntry {
+                path: f.path.clone(),
+                state: f.state,
+                blob_a: f.blob_a.clone(),
+                blob_b: f.blob_b.clone(),
+                status: FileStatus::Modified,
+                old_path: None,
+                additions: 0,
+                deletions: 0,
+            }).collect(),
+        };
+        s.to_persisted()
+    }
+
+    #[test]
+    fn refresh_keeps_reviewed_stable_for_unchanged_blobs() {
+        let files = [reviewed_stable_entry("a.rs", "aa", "bb")];
+        let snap = snapshot(&files);
+        let new_diff = vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))];
+        let result = merge_state(new_diff, Some(snap), &HashSet::new());
+        assert_eq!(result[0].state, ReviewState::ReviewedStable);
+    }
+
+    #[test]
+    fn refresh_resets_to_unreviewed_for_changed_blobs() {
+        let files = [reviewed_stable_entry("a.rs", "aa", "bb")];
+        let snap = snapshot(&files);
+        let new_diff = vec![entry("a.rs", Some(oid("aa")), Some(oid("cc")))];
+        let result = merge_state(new_diff, Some(snap), &HashSet::new());
+        assert_eq!(result[0].state, ReviewState::Unreviewed);
+    }
+
+    #[test]
+    fn refresh_adds_new_files_as_unreviewed() {
+        let files = [reviewed_stable_entry("a.rs", "aa", "bb")];
+        let snap = snapshot(&files);
+        let new_diff = vec![
+            entry("a.rs", Some(oid("aa")), Some(oid("bb"))),
+            entry("new.rs", Some(oid("cc")), Some(oid("dd"))),
+        ];
+        let result = merge_state(new_diff, Some(snap), &HashSet::new());
+        assert_eq!(result[1].path, PathBuf::from("new.rs"));
+        assert_eq!(result[1].state, ReviewState::Unreviewed);
+    }
+
+    #[test]
+    fn refresh_removes_files_no_longer_in_diff() {
+        let files = [
+            reviewed_stable_entry("a.rs", "aa", "bb"),
+            reviewed_stable_entry("gone.rs", "cc", "dd"),
+        ];
+        let snap = snapshot(&files);
+        let new_diff = vec![entry("a.rs", Some(oid("aa")), Some(oid("bb")))];
+        let result = merge_state(new_diff, Some(snap), &HashSet::new());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, PathBuf::from("a.rs"));
     }
 }

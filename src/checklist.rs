@@ -1,3 +1,7 @@
+use std::path::Path;
+
+use color_eyre::eyre::Result;
+
 use crate::session::{FileEntry, ReviewState, Session};
 
 pub(crate) struct Checklist {
@@ -30,11 +34,19 @@ impl Checklist {
         }
     }
 
+    pub(crate) fn refresh(&mut self, repo_root: &Path) -> Result<()> {
+        self.session.refresh(repo_root)?;
+        if !self.session.files.is_empty() {
+            self.selected = self.selected.min(self.session.files.len() - 1);
+        }
+        Ok(())
+    }
+
     pub(crate) fn toggle_reviewed(&mut self) {
         if let Some(entry) = self.session.files.get_mut(self.selected) {
             entry.state = match entry.state {
                 ReviewState::Unreviewed => ReviewState::ReviewedStable,
-                ReviewState::ReviewedStable => ReviewState::Unreviewed,
+                ReviewState::ReviewedStable | ReviewState::ReviewedDirty => ReviewState::Unreviewed,
             };
         }
     }
