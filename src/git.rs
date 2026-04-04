@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,7 +49,7 @@ pub(crate) fn diff_files(
     let raw_entries: Vec<RawEntry> = raw_out.lines().filter_map(parse_raw_line).collect();
     let counts: Vec<(u32, u32)> = numstat_out.lines().filter_map(parse_numstat_line).collect();
 
-    let entries = raw_entries
+    let mut entries: Vec<DiffEntry> = raw_entries
         .into_iter()
         .enumerate()
         .map(|(i, raw)| {
@@ -67,25 +66,48 @@ pub(crate) fn diff_files(
         })
         .collect();
 
+    // git diff-index outputs all-zeros for working tree blobs. Replace them with
+    // real content hashes so merge_state can detect edits after a file is reviewed.
+    if ref_b == "." {
+        populate_working_tree_blobs(repo_root, &mut entries)?;
+    }
+
     Ok(entries)
 }
 
-pub(crate) fn dirty_paths(repo_root: &Path) -> Result<HashSet<PathBuf>> {
+fn populate_working_tree_blobs(repo_root: &Path, entries: &mut Vec<DiffEntry>) -> Result<()> {
+    // Collect indices of entries where the file exists on disk (not deleted).
+    let indices: Vec<usize> = entries.iter().enumerate()
+        .filter(|(_, e)| e.blob_b.is_none() && repo_root.join(&e.path).exists())
+        .map(|(i, _)| i)
+        .collect();
+    if indices.is_empty() {
+        return Ok(());
+    }
+    let paths: Vec<&Path> = indices.iter().map(|&i| entries[i].path.as_path()).collect();
+    let hashes = hash_working_tree_blobs(repo_root, &paths)?;
+    for (&idx, hash) in indices.iter().zip(hashes) {
+        entries[idx].blob_b = hash;
+    }
+    Ok(())
+}
+
+fn hash_working_tree_blobs(repo_root: &Path, paths: &[&Path]) -> Result<Vec<Option<String>>> {
     let output = Command::new("git")
-        .args(["diff-index", "--name-only", "HEAD"])
+        .arg("hash-object")
+        .args(paths)
         .current_dir(repo_root)
         .output()?;
-
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git failed: {stderr}");
+        return Ok(vec![None; paths.len()]);
     }
-
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| eyre!("git returned non-UTF-8 output"))?;
-
-    Ok(stdout.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+    let mut result: Vec<Option<String>> = stdout.lines().map(|l| non_zero_oid(l)).collect();
+    result.resize(paths.len(), None);
+    Ok(result)
 }
+
 
 pub(crate) fn sanitise_ref(git_ref: &str) -> String {
     if git_ref == "." {

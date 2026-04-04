@@ -157,3 +157,52 @@ fn ansi_color(index: u8, bright: bool) -> Color {
         _ => Color::Reset,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    const CUSTOM_ADDED: Color = Color::Rgb(0x99, 0xBE, 0x70);
+    const CUSTOM_DELETED: Color = Color::Rgb(0xF0, 0x5E, 0x48);
+
+    fn first_span_fg(text: &ratatui::text::Text) -> Color {
+        text.lines[0].spans[0].style.fg.unwrap()
+    }
+
+    fn first_span_bg(text: &ratatui::text::Text) -> Color {
+        text.lines[0].spans[0].style.bg.unwrap()
+    }
+
+    #[test]
+    fn green_fg_remaps_to_diff_added() {
+        // ESC[32m is ANSI green foreground
+        let input = b"\x1b[32mtext\x1b[0m";
+        let text = parse(input, CUSTOM_ADDED, CUSTOM_DELETED);
+        assert_eq!(first_span_fg(&text), CUSTOM_ADDED);
+    }
+
+    #[test]
+    fn red_fg_remaps_to_diff_deleted() {
+        // ESC[31m is ANSI red foreground
+        let input = b"\x1b[31mtext\x1b[0m";
+        let text = parse(input, CUSTOM_ADDED, CUSTOM_DELETED);
+        assert_eq!(first_span_fg(&text), CUSTOM_DELETED);
+    }
+
+    #[test]
+    fn green_bg_remaps_to_diff_added() {
+        // ESC[42m is ANSI green background
+        let input = b"\x1b[42mtext\x1b[0m";
+        let text = parse(input, CUSTOM_ADDED, CUSTOM_DELETED);
+        assert_eq!(first_span_bg(&text), CUSTOM_ADDED);
+    }
+
+    #[test]
+    fn red_bg_remaps_to_diff_deleted() {
+        // ESC[41m is ANSI red background
+        let input = b"\x1b[41mtext\x1b[0m";
+        let text = parse(input, CUSTOM_ADDED, CUSTOM_DELETED);
+        assert_eq!(first_span_bg(&text), CUSTOM_DELETED);
+    }
+}

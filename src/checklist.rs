@@ -45,8 +45,9 @@ impl Checklist {
     pub(crate) fn toggle_reviewed(&mut self) {
         if let Some(entry) = self.session.files.get_mut(self.selected) {
             entry.state = match entry.state {
-                ReviewState::Unreviewed => ReviewState::ReviewedStable,
-                ReviewState::ReviewedStable | ReviewState::ReviewedDirty => ReviewState::Unreviewed,
+                ReviewState::Unreviewed    => ReviewState::ReviewedStable,
+                ReviewState::ReviewedDirty => ReviewState::ReviewedStable,
+                ReviewState::ReviewedStable => ReviewState::Unreviewed,
             };
         }
     }

@@ -1,0 +1,55 @@
+# Tree View
+
+## Intent
+Display the file list as a directory tree rather than a flat list of paths, so the hierarchical structure of the changed files is immediately visible. A key toggles between tree and flat views. The tree is compact — directories and files share rows where possible rather than each occupying a dedicated line.
+
+## Approach
+
+**Toggle key**: `v` — free, semantically clear. Added to the key handler in `tui.rs` and documented in `SPEC.md`.
+
+**ViewMode**: A `ViewMode` enum (Flat / Tree) is held in the run loop alongside `preview_scroll`, `split_row`, etc. It is a pure UI concern and does not touch `Checklist`.
+
+**Tree representation**: A `TreeRow` enum is built from `session.files` at render time:
+- `Dir { prefix: String, label: String }` — shown as a directory line, not selectable
+- `File { prefix: String, file_index: usize }` — selectable; maps back to `session.files[file_index]`
+
+The `prefix` string carries the tree-drawing characters for that row (e.g. `│ ├ `). It is computed during the tree walk by tracking whether each ancestor level has remaining siblings.
+
+**Compactness via path compression**: Directory nodes with a single directory child are merged into one row (e.g. `active/building/` rather than `active/` + `building/`). This eliminates wasted lines for deep but narrow trees. Directories with multiple children, or whose only child is a file, are not compressed.
+
+**Visual format**: 2 characters per level (`├ `, `└ `, `│ `, `  `). File rows show the tree prefix and filename on the left, with checkbox, status, and counts flush right (padded to terminal width). Directory rows show only the tree prefix and directory name — no stats.
+
+```
+ ├ .gitignore                            [ ] M   +3   -1
+ ├ changes/
+ │ ├ active/
+ │ │ └ building/
+ │ │   └ theme-diff-colors.md           [ ] M   +8   -4
+ │ └ archive/
+ │   └ 2026-04-01-preview-scroll.md     [ ] A  +18   -0
+ └ src/
+   ├ ansi.rs                             [ ] M  +22  -11
+   └ tui.rs                              [ ] M  +88  -45
+```
+
+**View toggle**: `checklist.selected` is an index into `session.files`, which is unchanged by the toggle. The selected file therefore remains selected and file order is preserved across view switches. `ListState::select` is given the visual row index of `checklist.selected` in the tree so ratatui scrolls the list pane to show it.
+
+**Rendering**: In tree mode, `render_checklist` builds `TreeRow`s and renders them as `ListItem`s. Each file row is a `Line` composed of `prefix + filename` left-padded to terminal width with the stats appended flush right.
+
+**Navigation**: `select_next`/`select_prev` on `Checklist` already operate on the file index — no change needed. The tree view always highlights a file row.
+
+**Mouse selection**: `handle_mouse` currently calls `checklist.select_index(list_row)` directly and returns `Continue`. It is changed to return a new `SelectVisualRow(usize)` control. In flat mode the run loop maps visual row → file index directly. In tree mode it looks up the `TreeRow` at that index and selects the file if it is a `File` row; `Dir` rows are ignored.
+
+**Footer**: Footer hint gains `v tree/flat` entry.
+
+Review cadence: per-task review.
+
+## Plan
+- [ ] ADD `tui.rs`: `ViewMode` enum (Flat/Tree), `ToggleView` and `SelectVisualRow(usize)` control variants
+- [ ] ADD `tui.rs`: `TreeRow` enum and `build_tree(files: &[FileEntry]) -> Vec<TreeRow>` function with path compression and prefix-string computation (2-char-per-level box-drawing characters)
+- [ ] UPDATE `tui.rs`: `handle_checklist_key` — bind `v` to `ToggleView`
+- [ ] UPDATE `tui.rs`: `handle_mouse` — return `SelectVisualRow(usize)` instead of calling `checklist.select_index` directly
+- [ ] UPDATE `tui.rs`: run loop — track `view_mode`, handle `ToggleView` and `SelectVisualRow`
+- [ ] UPDATE `tui.rs`: `render_checklist` — accept `view_mode`, build tree rows in tree mode, render file rows as `prefix + filename` left / stats flush right, compute `ListState` visual row from `checklist.selected`
+- [ ] UPDATE `tui.rs`: footer hint — add `v tree/flat`
+- [ ] UPDATE `SPEC.md` — add `v` to navigation table, describe tree view in Behaviour under File Checklist

@@ -36,13 +36,10 @@ fn run(args: Args) -> Result<()> {
 
     let repo_root = git::repo_root()?;
 
-    let config = config::Config::load(&repo_root)?;
+    let config = config::Config::load()?;
     let theme = theme::Theme::from_name(&config.theme)?;
 
-    let session_key = format!("{}__{}",
-        git::sanitise_ref(&ref_a),
-        git::sanitise_ref(&ref_b),
-    );
+    let session_key = session::session_id(&ref_a, &ref_b);
     let worktrees_dir = repo_root.join(".grit").join("worktrees").join(session_key);
     let worktree_a = worktree::create(&repo_root, &ref_a, &worktrees_dir)?;
     let worktree_b = worktree::create(&repo_root, &ref_b, &worktrees_dir)?;
@@ -59,6 +56,8 @@ fn run(args: Args) -> Result<()> {
         theme,
         worktree_a.path(),
         worktree_b.path(),
+        config.auto_refresh,
+        config.preview_split,
     )?;
 
     // Reached only on clean exit — unclean exits leave worktrees for reuse.

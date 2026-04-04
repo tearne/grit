@@ -18,11 +18,13 @@ grit <ref-a> [ref-b]
 
 ### Configuration
 
-Configuration is read from `.grit.toml` at the repository root. All fields are optional.
+Configuration is read from the user's platform config directory — `~/.config/grit/config.toml` on Linux (XDG default; the actual path follows the platform convention on macOS and Windows). All fields are optional; if the file is absent, defaults apply.
 
 ```toml
 diff_tool = "difft --color always"  # default: difft --color always
 theme = "autumn"                    # available: default, autumn; default: autumn
+auto_refresh = 10                   # seconds between automatic refreshes; default: 10; minimum: 1
+preview_split = 50                  # percentage of terminal height given to the preview pane; default: 50; range: 1–99
 ```
 
 ## Behaviour
@@ -60,11 +62,11 @@ Status characters: `A` added (green), `D` deleted (red), `M` modified (yellow), 
 
 ### Diff View
 
-The TUI title bar shows `  {ref_a}  →  {ref_b}` on the left and `grit v{version}` flush to the right edge.
+The title bar shows `  {ref_a}  →  {ref_b}` on the left and `grit v{version}` flush to the right edge.
 
-The checklist screen is split into a file list pane and a diff preview pane, separated by a draggable divider. The default split is 2/3 file list, 1/3 preview. Selecting a file immediately updates the preview; the preview always shows from the top with no user-controlled scrolling.
+The checklist screen is split into a file list pane and a diff preview pane, separated by a draggable divider. The default split gives 50% of the available height to the preview pane, configurable via `preview_split`. Selecting a file immediately updates the preview.
 
-Pressing Enter promotes the preview to a fullscreen diff view where the user can scroll freely. The configured diff tool is invoked with the two worktree paths for that file; its output (including ANSI colour sequences) is captured and rendered by ratatui. The diff tool is passed `$COLUMNS` matching the current terminal width; on terminal resize the diff is re-captured at the new width and the scroll offset resets to zero.
+Pressing Enter maximises the preview pane by collapsing the file list; the divider label changes to show the selected file path and a restore hint. Pressing Enter again restores the previous split position. There is no separate fullscreen mode — the checklist view is always active.
 
 Each pane has a 1-column scroll-indicator strip on the right edge showing `↑` when content is hidden above and `↓` when content is hidden below.
 
@@ -89,15 +91,26 @@ On refresh, `grit` recomputes the diff:
 - New files are added as **unreviewed**
 - Files no longer in the diff are removed
 
-Refresh is triggered manually with `R` or automatically every 30 seconds. After each refresh the session is saved to disk.
+On the interval set by `auto_refresh` (default 10 seconds), grit checks whether the diff has changed. If a change is detected, a "Changes detected — press R to refresh" notification appears in the footer; the current view is otherwise undisturbed. `R` applies the refresh and saves the session to disk.
 
 ### Clipboard
 
-From the checklist or diff view, `y` copies `path:line` for the `ref_b` (new) side to the clipboard via OSC 52; `Y` copies for the `ref_a` (old) side. The line number reflects the current scroll position in the diff view, or 1 when invoked from the checklist. A brief confirmation appears in the footer. If the copied path resolves into a grit-managed worktree (`.grit/worktrees/…`), the confirmation is appended with a warning that edits there will be lost on exit.
+`y` copies `path:line` for the `ref_b` (new) side to the clipboard via OSC 52; `Y` copies for the `ref_a` (old) side. The line number always reflects the current preview scroll position (`scroll + 1`). A brief confirmation appears in the footer. If the copied path resolves into a grit-managed worktree (`.grit/worktrees/…`), the confirmation is appended with a warning that edits there will be lost on exit.
 
 ### Navigation
 
 All TUI views support both keyboard and mouse navigation. Mouse clicks select items.
+
+#### Mouse interactions (preview pane)
+
+| Interaction | Action |
+|-------------|--------|
+| Scroll wheel down | Scroll preview down by 3 lines |
+| Scroll wheel up | Scroll preview up by 3 lines |
+| Left click — left half | Copy `path:line` for `ref_a` (old) to clipboard (equivalent to `Y`) |
+| Left click — right half | Copy `path:line` for `ref_b` (new) to clipboard (equivalent to `y`) |
+
+Mouse interactions outside the preview pane (title bar, file list, divider) are not affected.
 
 Checklist keyboard bindings:
 
@@ -107,7 +120,7 @@ Checklist keyboard bindings:
 | `i` / `↑` | Select previous file |
 | `j` | Scroll preview down |
 | `k` | Scroll preview up |
-| `Enter` | Promote preview to fullscreen diff |
+| `Enter` | Toggle fullscreen preview (collapse file list / restore split) |
 | `r` / `Space` | Toggle reviewed state |
 | `R` | Refresh (recompute diff) |
 | `t` | Cycle theme |
@@ -119,15 +132,14 @@ Checklist keyboard bindings:
 
 `h` and `l` are not bound — the checklist is a single column so horizontal movement has no meaning.
 
-Fullscreen diff keyboard bindings:
+## Themes
 
-| Key | Action |
-|-----|--------|
-| `j` / `↓` | Scroll down |
-| `k` / `↑` | Scroll up |
-| `y` | Copy `path:line` for `ref_b` (new) to clipboard |
-| `Y` | Copy `path:line` for `ref_a` (old) to clipboard |
-| `Enter` / `q` / `Esc` / `Ctrl-C` | Return to checklist |
+Two themes are available: `default` and `autumn`. The active theme is selected via the `theme` config key and can be cycled at runtime with `t`.
+
+A theme governs the full UI — title bar, checklist status indicators, line-count colours, the divider, the footer, and diff output. Diff tool colors (ANSI green and red) are remapped to match the active theme's palette so the diff output feels consistent with the rest of the UI rather than displaying raw terminal colors.
+
+- **default** — uses standard terminal colors; diff added lines render in ANSI green, deleted in ANSI red
+- **autumn** — a warm dark palette; diff added lines render in `#99BE70`, deleted in `#F05E48`, matching `status_added`/`status_deleted`
 
 ## Constraints
 
@@ -145,8 +157,7 @@ Fullscreen diff keyboard bindings:
 - Review state survives exit and restores correctly on next invocation
 - After a ref advances: unchanged files stay ticked, changed files reset to unreviewed
 - A reviewed file with uncommitted working tree changes shows as reviewed, dirty
-- `y`/`Y` writes `path:line` via OSC 52 and shows confirmation in footer
-- `y`/`Y` in diff view uses the current scroll line, not 1
+- `y`/`Y` writes `path:line` via OSC 52 and shows confirmation in footer, using the current preview scroll position
 - Diff tool not on PATH → clear error before TUI opens
 - Exiting with a worktree containing uncommitted changes → user is warned and prompted before removal
 - Exiting with a worktree containing unpushed commits → user is warned and prompted before removal

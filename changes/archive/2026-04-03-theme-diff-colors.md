@@ -23,15 +23,17 @@ Review cadence: per-task.
 
 ## Plan
 
-- [ ] UPDATE IMPL: add `diff_added: Color` and `diff_deleted: Color` to `Theme`; set autumn values to `#99BE70`/`#F05E48`, default values to `Color::Green`/`Color::Red`
-- [ ] UPDATE IMPL: `ansi::parse` — add `diff_added: Color, diff_deleted: Color` parameters; remap green and red variants (fg and bg) in `apply_sgr`
-- [ ] UPDATE IMPL: `capture_diff` — accept and forward `diff_added`/`diff_deleted` to `ansi::parse`
-- [ ] UPDATE IMPL: `WorkItem` — add `diff_added: Color, diff_deleted: Color` fields; update `work_items()` to accept and stamp them
-- [ ] UPDATE IMPL: `CycleTheme` branch in `tui.rs` — add `cached.clear()` and `worker.reset()` so stale parsed text is discarded on theme change
-- [ ] ADD TEST: `ansi::parse` remaps ANSI green fg to the supplied `diff_added` color
-- [ ] ADD TEST: `ansi::parse` remaps ANSI red fg to the supplied `diff_deleted` color
-- [ ] ADD TEST: `ansi::parse` remaps ANSI green bg to the supplied `diff_added` color
-- [ ] ADD TEST: `ansi::parse` remaps ANSI red bg to the supplied `diff_deleted` color
-- [ ] UPDATE SPEC: add a Themes section describing the available themes and that the active theme governs the full UI including diff output colors
+- [x] UPDATE IMPL: add `diff_added: Color` and `diff_deleted: Color` to `Theme`; set autumn values to `#99BE70`/`#F05E48`, default values to `Color::Green`/`Color::Red`
+- [x] UPDATE IMPL: `ansi::parse` — add `diff_added: Color, diff_deleted: Color` parameters; remap green and red variants (fg and bg) in `apply_sgr`
+- [x] UPDATE IMPL: `capture_diff` — accept and forward `diff_added`/`diff_deleted` to `ansi::parse`
+- [x] UPDATE IMPL: `WorkItem` — add `diff_added: Color, diff_deleted: Color` fields; update `work_items()` to accept and stamp them
+- [x] UPDATE IMPL: `CycleTheme` branch in `tui.rs` — add `cached.clear()` and `worker.reset()` so stale parsed text is discarded on theme change
+- [x] ADD TEST: `ansi::parse` remaps ANSI green fg to the supplied `diff_added` color
+- [x] ADD TEST: `ansi::parse` remaps ANSI red fg to the supplied `diff_deleted` color
+- [x] ADD TEST: `ansi::parse` remaps ANSI green bg to the supplied `diff_added` color
+- [x] ADD TEST: `ansi::parse` remaps ANSI red bg to the supplied `diff_deleted` color
+- [x] UPDATE SPEC: add a Themes section describing the available themes and that the active theme governs the full UI including diff output colors
 
 ## Conclusion
+
+Delivered in full. The two `capture_diff` call sites in `run_diff_view` (initial load and resize) were the last compile errors; both now thread `theme.diff_added` and `theme.diff_deleted`. Four unit tests in `ansi::tests` verify fg and bg remapping for both green and red. A Themes section added to `SPEC.md` documents the two available themes and the color-remapping behaviour.

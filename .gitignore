@@ -1,5 +1,5 @@
 /target
 /.grit/
 CLAUDE.md
-planner/
-builder/
+changes/agents/
+supervisor_start.py
