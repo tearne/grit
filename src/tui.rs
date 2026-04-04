@@ -24,9 +24,7 @@ use ratatui::{
 };
 
 use crate::checklist::Checklist;
-use crate::git::FileStatus;
 use crate::open_command;
-use crate::session::ReviewState;
 use crate::theme::Theme;
 
 const BRAILLE_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -69,6 +67,7 @@ impl Tui {
         let mut last_refresh = std::time::Instant::now();
         let mut saved_split: Option<u16> = None;
         let mut refresh_pending = false;
+        let mut view_mode = ViewMode::Tree;
 
         let mut file_paths = build_file_paths(&checklist.session.files, worktree_a, worktree_b);
 
@@ -77,7 +76,6 @@ impl Tui {
 
         loop {
             let total = checklist.session.files.len();
-            list_state.select(if total > 0 { Some(checklist.selected) } else { None });
 
             while let Ok((index, text)) = worker.result_rx.try_recv() {
                 cached.insert(index, text);
@@ -105,7 +103,7 @@ impl Tui {
 
             let preview = cached.get(&checklist.selected);
             let active_notif = active_notification(&notification);
-            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, preview_scroll, split_row, active_notif, &theme, saved_split.is_some(), refresh_pending)?;
+            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, preview_scroll, split_row, active_notif, &theme, saved_split.is_some(), refresh_pending, view_mode)?;
 
             if last_refresh.elapsed() >= std::time::Duration::from_secs(auto_refresh) {
                 if checklist.session.has_pending_changes(repo_root)? {
@@ -213,6 +211,25 @@ impl Tui {
                     last_selected = None;
                     worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
                 }
+                ChecklistControl::ToggleView => {
+                    view_mode = match view_mode {
+                        ViewMode::Flat => ViewMode::Tree,
+                        ViewMode::Tree => ViewMode::Flat,
+                    };
+                    last_selected = None;
+                }
+                ChecklistControl::SelectVisualRow(row) => {
+                    match view_mode {
+                        ViewMode::Flat => checklist.select_index(row),
+                        ViewMode::Tree => {
+                            let tree = build_tree(&checklist.session.files);
+                            if let Some(TreeRow::File { file_index, .. }) = tree.get(row) {
+                                checklist.selected = *file_index;
+                                last_selected = None;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -229,6 +246,7 @@ impl Tui {
         theme: &Theme,
         fullscreen: bool,
         refresh_pending: bool,
+        view_mode: ViewMode,
     ) -> Result<()> {
         let session = &checklist.session;
         let total = session.files.len();
@@ -262,44 +280,53 @@ impl Tui {
             let max_del = session.files.iter().map(|f| f.deletions).max().unwrap_or(0);
             let count_width = format!("+{max_add}").len().max(format!("-{max_del}").len());
 
-            let items: Vec<ListItem> = session
-                .files
-                .iter()
-                .map(|f| {
-                    let checkbox = match f.state {
-                        ReviewState::Unreviewed => "[ ]",
-                        ReviewState::ReviewedStable => "[x]",
-                        ReviewState::ReviewedDirty => "[~]",
-                    };
-                    let (status_char, status_style) = match f.status {
-                        FileStatus::Added    => ("A", theme.status_added),
-                        FileStatus::Deleted  => ("D", theme.status_deleted),
-                        FileStatus::Modified => ("M", theme.status_modified),
-                        FileStatus::Moved    => ("R", theme.status_moved),
-                    };
-                    let add_str = format!("+{}", f.additions);
-                    let del_str = format!("-{}", f.deletions);
-                    let mut spans = vec![
-                        Span::raw(format!(" {checkbox} ")),
-                        Span::styled(status_char, status_style),
-                        Span::raw("  "),
-                        Span::styled(format!("{:>count_width$}", add_str), count_style(f.additions, theme.count_positive, theme.count_positive_bg)),
-                        Span::raw("  "),
-                        Span::styled(format!("{:>count_width$}", del_str), count_style(f.deletions, theme.count_negative, theme.count_negative_bg)),
-                        Span::raw(format!("  {}", f.path.display())),
-                    ];
-                    if let FileStatus::Moved = f.status {
-                        if let Some(old) = &f.old_path {
-                            spans.push(Span::styled(
-                                format!("  (was: {})", old.display()),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ));
+            let (items, selected_visual_row): (Vec<ListItem>, Option<usize>) = match view_mode {
+                ViewMode::Flat => {
+                    let items = session.files.iter().map(|f| {
+                        flat_file_item(f, count_width, theme)
+                    }).collect();
+                    (items, if total > 0 { Some(checklist.selected) } else { None })
+                }
+                ViewMode::Tree => {
+                    let tree = build_tree(&session.files);
+                    // Measure the longest prefix+filename so all stats share the same x-position.
+                    let max_left_width = tree.iter().filter_map(|row| {
+                        if let TreeRow::File { prefix, file_index } = row {
+                            let f = &session.files[*file_index];
+                            let filename = f.path.file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| f.path.display().to_string());
+                            Some(format!("{}{}", prefix, filename).chars().count())
+                        } else {
+                            None
                         }
-                    }
-                    ListItem::new(Line::from(spans))
-                })
-                .collect();
+                    }).max().unwrap_or(0);
+                    let mut selected_row = None;
+                    let items = tree.iter().enumerate().map(|(row_idx, row)| {
+                        match row {
+                            TreeRow::Dir { prefix, label } => {
+                                ListItem::new(Line::from(vec![
+                                    Span::raw(prefix.clone()),
+                                    Span::styled(label.clone(), Style::default().add_modifier(Modifier::DIM)),
+                                ]))
+                            }
+                            TreeRow::File { prefix, file_index } => {
+                                if *file_index == checklist.selected {
+                                    selected_row = Some(row_idx);
+                                }
+                                let f = &session.files[*file_index];
+                                let filename = f.path.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| f.path.display().to_string());
+                                tree_file_item(prefix, &filename, f, count_width, max_left_width, list_chunks[0].width, theme)
+                            }
+                        }
+                    }).collect();
+                    (items, selected_row)
+                }
+            };
 
+            list_state.select(selected_visual_row);
             let list = List::new(items).highlight_style(theme.list_highlight);
             frame.render_stateful_widget(list, list_chunks[0], list_state);
 
@@ -349,7 +376,7 @@ impl Tui {
             }
 
             let footer_text = notification.unwrap_or(
-                " u/i navigate   j/k scroll preview   space toggle reviewed   r refresh   y/Y copy path (new/old)",
+                " u/i navigate   j/k scroll preview   space toggle reviewed   r refresh   y/Y copy path (new/old)   v tree/flat",
             );
             let footer_style = if notification.is_some() {
                 theme.footer_notification
@@ -384,7 +411,7 @@ impl Tui {
         }
         match event::read()? {
             Event::Key(key) => Ok(handle_checklist_key(key, checklist)),
-            Event::Mouse(mouse) => Ok(handle_mouse(mouse, checklist, split_row, dragging, fullscreen, width)),
+            Event::Mouse(mouse) => Ok(handle_mouse(mouse, split_row, dragging, fullscreen, width)),
             Event::Resize(_, _) => Ok(ChecklistControl::Resize),
             _ => Ok(ChecklistControl::Continue),
         }
@@ -467,19 +494,134 @@ fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16, di
         .collect()
 }
 
+enum TreeRow {
+    Dir { prefix: String, label: String },
+    File { prefix: String, file_index: usize },
+}
+
+fn build_tree(files: &[crate::session::FileEntry]) -> Vec<TreeRow> {
+    // Build a virtual directory tree from the flat file list, then walk it
+    // into a sequence of TreeRow values using box-drawing prefixes.
+    // Directories with a single directory child are path-compressed.
+
+    struct DirNode {
+        // label used for display — may span multiple path components after compression
+        label: String,
+        children_dirs: Vec<DirNode>,
+        children_files: Vec<usize>, // indices into `files`
+    }
+
+    fn insert(root: &mut DirNode, components: &[&str], file_index: usize) {
+        if components.is_empty() {
+            root.children_files.push(file_index);
+            return;
+        }
+        let name = components[0];
+        if let Some(child) = root.children_dirs.iter_mut().find(|d| d.label == name) {
+            insert(child, &components[1..], file_index);
+        } else {
+            let mut child = DirNode { label: name.to_string(), children_dirs: vec![], children_files: vec![] };
+            insert(&mut child, &components[1..], file_index);
+            root.children_dirs.push(child);
+        }
+    }
+
+    fn compress(node: &mut DirNode) {
+        for child in &mut node.children_dirs {
+            compress(child);
+        }
+        // Merge single-dir-child nodes upward (path compression)
+        loop {
+            if node.children_files.is_empty() && node.children_dirs.len() == 1 {
+                let only = node.children_dirs.remove(0);
+                node.label = format!("{}/{}", node.label, only.label);
+                node.children_dirs = only.children_dirs;
+                node.children_files = only.children_files;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn walk_children(node: &DirNode, rows: &mut Vec<TreeRow>, prefix: &str) {
+        let dir_count = node.children_dirs.len();
+        let file_count = node.children_files.len();
+        let total = dir_count + file_count;
+
+        for (i, dir) in node.children_dirs.iter().enumerate() {
+            let last = i == total - 1 && file_count == 0;
+            let connector = if last { "└ " } else { "├ " };
+            rows.push(TreeRow::Dir { prefix: format!("{}{}", prefix, connector), label: format!("{}/", dir.label) });
+            let child_prefix = format!("{}{}", prefix, if last { "  " } else { "│ " });
+            walk_children(dir, rows, &child_prefix);
+        }
+        for (i, &file_index) in node.children_files.iter().enumerate() {
+            let last = i == file_count - 1;
+            let connector = if last { "└ " } else { "├ " };
+            rows.push(TreeRow::File { prefix: format!("{}{}", prefix, connector), file_index });
+        }
+    }
+
+    let mut root = DirNode { label: String::new(), children_dirs: vec![], children_files: vec![] };
+
+    for (i, file) in files.iter().enumerate() {
+        let components: Vec<&str> = file.path.components()
+            .map(|c| c.as_os_str().to_str().expect("valid UTF-8 path"))
+            .collect();
+        if components.len() == 1 {
+            root.children_files.push(i);
+        } else {
+            let dirs = &components[..components.len() - 1];
+            insert(&mut root, dirs, i);
+        }
+    }
+
+    for dir in &mut root.children_dirs {
+        compress(dir);
+    }
+
+    let mut rows = Vec::new();
+    let dir_count = root.children_dirs.len();
+    let file_count = root.children_files.len();
+    let total = dir_count + file_count;
+
+    for (i, dir) in root.children_dirs.iter().enumerate() {
+        let last = i == total - 1 && file_count == 0;
+        let connector = if last { "└ " } else { "├ " };
+        rows.push(TreeRow::Dir { prefix: connector.to_string(), label: format!("{}/", dir.label) });
+        let child_prefix = if last { "  " } else { "│ " };
+        walk_children(dir, &mut rows, child_prefix);
+    }
+    for (i, &file_index) in root.children_files.iter().enumerate() {
+        let last = i == file_count - 1;
+        let connector = if last { "└ " } else { "├ " };
+        rows.push(TreeRow::File { prefix: connector.to_string(), file_index });
+    }
+
+    rows
+}
+
 enum ChecklistControl {
     Continue,
     Save,
     Refresh,
     CycleTheme,
     ToggleFullscreen,
+    ToggleView,
     CopyPathNew,
     CopyPathOld,
     Quit,
     AdjustSplit(i32),
     ScrollPreview(i32),
     UpdateDrag(u16),
+    SelectVisualRow(usize),
     Resize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    Flat,
+    Tree,
 }
 
 fn title_bar_line(ref_a: &str, ref_b: &str, width: u16, refresh_pending: bool) -> Line<'static> {
@@ -528,6 +670,84 @@ fn count_style(count: u32, fg: Color, heavy_bg: Color) -> Style {
     }
 }
 
+fn flat_file_item(f: &crate::session::FileEntry, count_width: usize, theme: &Theme) -> ListItem<'static> {
+    let checkbox = match f.state {
+        crate::session::ReviewState::Unreviewed => "[ ]",
+        crate::session::ReviewState::ReviewedStable => "[x]",
+        crate::session::ReviewState::ReviewedDirty => "[~]",
+    };
+    let (status_char, status_style) = file_status_display(f.status, theme);
+    let add_str = format!("+{}", f.additions);
+    let del_str = format!("-{}", f.deletions);
+    let mut spans = vec![
+        Span::raw(format!(" {checkbox} ")),
+        Span::styled(status_char, status_style),
+        Span::raw("  "),
+        Span::styled(format!("{:>count_width$}", add_str), count_style(f.additions, theme.count_positive, theme.count_positive_bg)),
+        Span::raw("  "),
+        Span::styled(format!("{:>count_width$}", del_str), count_style(f.deletions, theme.count_negative, theme.count_negative_bg)),
+        Span::raw(format!("  {}", f.path.display())),
+    ];
+    if let crate::git::FileStatus::Moved = f.status {
+        if let Some(old) = &f.old_path {
+            spans.push(Span::styled(
+                format!("  (was: {})", old.display()),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn tree_file_item(prefix: &str, filename: &str, f: &crate::session::FileEntry, count_width: usize, max_left_width: usize, row_width: u16, theme: &Theme) -> ListItem<'static> {
+    let checkbox = match f.state {
+        crate::session::ReviewState::Unreviewed => "[ ]",
+        crate::session::ReviewState::ReviewedStable => "[x]",
+        crate::session::ReviewState::ReviewedDirty => "[~]",
+    };
+    let (status_char, status_style) = file_status_display(f.status, theme);
+    let add_str = format!("+{}", f.additions);
+    let del_str = format!("-{}", f.deletions);
+    let stats_str = format!(" {checkbox}  {status_char}  {:>count_width$}  {:>count_width$}", add_str, del_str);
+    let stats_len = stats_str.chars().count();
+    let full_left = format!("{}{}", prefix, filename);
+    let full_left_len = full_left.chars().count();
+    // Pad short filenames to the longest row so all stats share the same x-position.
+    let left_pad = max_left_width.saturating_sub(full_left_len);
+    let total = row_width as usize;
+    // When the whole line fits: right-align stats at the terminal edge.
+    // When stats overflow: they start at max_left_width+1 and clip uniformly across all rows.
+    let right_pad = total.saturating_sub(max_left_width + 1 + stats_len);
+    let mut spans = vec![
+        Span::raw(full_left),
+        Span::raw(" ".repeat(left_pad + right_pad + 1)),
+        Span::raw(format!("{checkbox} ")),
+        Span::styled(status_char, status_style),
+        Span::raw("  "),
+        Span::styled(format!("{:>count_width$}", add_str), count_style(f.additions, theme.count_positive, theme.count_positive_bg)),
+        Span::raw("  "),
+        Span::styled(format!("{:>count_width$}", del_str), count_style(f.deletions, theme.count_negative, theme.count_negative_bg)),
+    ];
+    if let crate::git::FileStatus::Moved = f.status {
+        if let Some(old) = &f.old_path {
+            spans.push(Span::styled(
+                format!("  ({})", old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn file_status_display(status: crate::git::FileStatus, theme: &Theme) -> (&'static str, Style) {
+    match status {
+        crate::git::FileStatus::Added    => ("A", theme.status_added),
+        crate::git::FileStatus::Deleted  => ("D", theme.status_deleted),
+        crate::git::FileStatus::Modified => ("M", theme.status_modified),
+        crate::git::FileStatus::Moved    => ("R", theme.status_moved),
+    }
+}
+
 fn build_file_paths(files: &[crate::session::FileEntry], worktree_a: &Path, worktree_b: &Path) -> Vec<(PathBuf, PathBuf)> {
     files.iter().map(|f| (worktree_a.join(&f.path), worktree_b.join(&f.path))).collect()
 }
@@ -573,6 +793,7 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
         }
         KeyCode::Char('r') => ChecklistControl::Refresh,
         KeyCode::Char('t') => ChecklistControl::CycleTheme,
+        KeyCode::Char('v') => ChecklistControl::ToggleView,
         KeyCode::Enter => ChecklistControl::ToggleFullscreen,
         KeyCode::Char('y') => ChecklistControl::CopyPathNew,
         KeyCode::Char('Y') => ChecklistControl::CopyPathOld,
@@ -586,7 +807,6 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
 
 fn handle_mouse(
     mouse: MouseEvent,
-    checklist: &mut Checklist,
     split_row: u16,
     dragging: &mut bool,
     fullscreen: bool,
@@ -600,7 +820,7 @@ fn handle_mouse(
                 *dragging = true;
             } else if mouse.row > 0 && mouse.row < divider_row {
                 let list_row = mouse.row.saturating_sub(1) as usize;
-                checklist.select_index(list_row);
+                return ChecklistControl::SelectVisualRow(list_row);
             } else if mouse.row > divider_row {
                 if mouse.column < width / 2 {
                     return ChecklistControl::CopyPathOld;

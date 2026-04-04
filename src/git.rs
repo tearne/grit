@@ -3,6 +3,7 @@ use std::process::Command;
 
 use color_eyre::eyre::{bail, eyre, Result};
 
+#[derive(Copy, Clone)]
 pub(crate) enum FileStatus {
     Added,
     Deleted,

@@ -60,6 +60,14 @@ Checkbox characters: `[ ]` unreviewed, `[x]` reviewed stable, `[~]` reviewed dir
 
 Status characters: `A` added (green), `D` deleted (red), `M` modified (yellow), `R` renamed/moved (cyan). Line counts are right-aligned and colour-coded green (`+`) and red (`-`), with intensity scaling by magnitude: dim for zero, normal for 1–99, bold for 100–999, bold with coloured background for 1000+. Renamed files append `(was: <old_path>)` in dim style.
 
+#### Tree View
+
+Pressing `v` toggles between flat and tree views. In tree view the file list is rendered as a compact directory tree using box-drawing characters (`├`, `└`, `│`). Directory nodes with a single directory child are path-compressed into one row (e.g. `changes/active/` rather than two separate lines). Directory rows are not selectable; navigation always lands on a file row. The selected file is preserved across view switches.
+
+File rows in tree view show the tree prefix and filename on the left, with checkbox, status character, and change counts flush right. Renamed files show the old filename (not the full old path) in dim style. Directory rows show only the prefix and directory name in dim style.
+
+Mouse clicks on directory rows are ignored; clicks on file rows select that file.
+
 ### Diff View
 
 The title bar shows `  {ref_a}  →  {ref_b}` on the left and `grit v{version}` flush to the right edge.
@@ -124,6 +132,7 @@ Checklist keyboard bindings:
 | `r` / `Space` | Toggle reviewed state |
 | `R` | Refresh (recompute diff) |
 | `t` | Cycle theme |
+| `v` | Toggle tree / flat view |
 | `y` | Copy `path:line` for `ref_b` (new) to clipboard |
 | `Y` | Copy `path:line` for `ref_a` (old) to clipboard |
 | `=` | Shrink file list (move divider up) |
