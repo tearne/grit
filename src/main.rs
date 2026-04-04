@@ -60,7 +60,9 @@ fn run(args: Args) -> Result<()> {
         config.preview_split,
     )?;
 
-    // Reached only on clean exit — unclean exits leave worktrees for reuse.
+    // Restore terminal before prompting — the TUI holds raw mode until dropped.
+    drop(tui);
+
     worktree::remove(&repo_root, worktree_a)?;
     worktree::remove(&repo_root, worktree_b)?;
 

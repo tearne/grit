@@ -21,6 +21,7 @@ pub(crate) struct Theme {
     pub(crate) footer_notification: Style,
     pub(crate) diff_added: Color,
     pub(crate) diff_deleted: Color,
+    pub(crate) diff_unmatched: Color,
 }
 
 impl Theme {
@@ -57,6 +58,7 @@ impl Theme {
             footer_notification:  Style::default().bg(Color::DarkGray).fg(Color::Yellow),
             diff_added:           Color::Green,
             diff_deleted:         Color::Red,
+            diff_unmatched:       Color::Magenta,
         }
     }
 
@@ -79,6 +81,7 @@ impl Theme {
             footer_notification:  Style::default().bg(Color::Rgb(0x21, 0x21, 0x21)).fg(Color::Rgb(0xFA, 0xD5, 0x66)),
             diff_added:           Color::Rgb(0x99, 0xBE, 0x70),
             diff_deleted:         Color::Rgb(0xF0, 0x5E, 0x48),
+            diff_unmatched:       Color::Rgb(0xBD, 0x82, 0xD7),
         }
     }
 }

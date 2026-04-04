@@ -103,7 +103,7 @@ On the interval set by `auto_refresh` (default 10 seconds), grit checks whether 
 
 ### Clipboard
 
-`y` copies `path:line` for the `ref_b` (new) side to the clipboard via OSC 52; `Y` copies for the `ref_a` (old) side. The line number always reflects the current preview scroll position (`scroll + 1`). A brief confirmation appears in the footer. If the copied path resolves into a grit-managed worktree (`.grit/worktrees/…`), the confirmation is appended with a warning that edits there will be lost on exit.
+`y` copies `path:line` for the `ref_b` (new) side to the clipboard via OSC 52; `Y` copies for the `ref_a` (old) side. The line number is derived from the diff output: `difft` embeds file line numbers in each rendered line — the old-file number appears at the left margin, the new-file number at approximately the midpoint of the terminal width. These are parsed from the cached diff text at the current scroll position. When no file line number can be parsed (e.g. header or hunk-separator lines), the fallback is `scroll + 1`. A brief confirmation appears in the footer. If the copied path resolves into a grit-managed worktree (`.grit/worktrees/…`), the confirmation is appended with a warning that edits there will be lost on exit.
 
 ### Navigation
 

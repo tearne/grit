@@ -72,7 +72,7 @@ impl Tui {
         let mut file_paths = build_file_paths(&checklist.session.files, worktree_a, worktree_b);
 
         let mut width = self.terminal.size()?.width.saturating_sub(1);
-        let worker = DiffWorker::start(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+        let worker = DiffWorker::start(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted, theme.diff_unmatched));
 
         loop {
             let total = checklist.session.files.len();
@@ -136,13 +136,13 @@ impl Tui {
                         last_selected = None;
                     }
                     file_paths = build_file_paths(&checklist.session.files, worktree_a, worktree_b);
-                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted, theme.diff_unmatched));
                 }
                 ChecklistControl::CycleTheme => {
                     theme = theme.next();
                     cached.clear();
                     last_selected = None;
-                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted, theme.diff_unmatched));
                 }
                 ChecklistControl::ToggleFullscreen => {
                     match saved_split {
@@ -152,7 +152,10 @@ impl Tui {
                 }
                 ChecklistControl::CopyPathNew => {
                     if let Some(file) = checklist.selected_file() {
-                        let mut msg = open_command::copy(&worktree_b.join(&file.path), (preview_scroll + 1) as u32);
+                        let line_num = cached.get(&checklist.selected)
+                            .and_then(|text| diff_line_numbers(text, preview_scroll, width).1)
+                            .unwrap_or((preview_scroll + 1) as u32);
+                        let mut msg = open_command::copy(&worktree_b.join(&file.path), line_num);
                         if crate::worktree::is_managed(worktree_b, repo_root) {
                             msg.push_str("  ⚠ grit-managed worktree — edits will be lost on exit");
                         }
@@ -161,7 +164,10 @@ impl Tui {
                 }
                 ChecklistControl::CopyPathOld => {
                     if let Some(file) = checklist.selected_file() {
-                        let mut msg = open_command::copy(&worktree_a.join(&file.path), (preview_scroll + 1) as u32);
+                        let line_num = cached.get(&checklist.selected)
+                            .and_then(|text| diff_line_numbers(text, preview_scroll, width).0)
+                            .unwrap_or((preview_scroll + 1) as u32);
+                        let mut msg = open_command::copy(&worktree_a.join(&file.path), line_num);
                         if crate::worktree::is_managed(worktree_a, repo_root) {
                             msg.push_str("  ⚠ grit-managed worktree — edits will be lost on exit");
                         }
@@ -209,7 +215,7 @@ impl Tui {
                     width = size.width.saturating_sub(1);
                     cached.clear();
                     last_selected = None;
-                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted));
+                    worker.reset(work_items(&file_paths, &diff_tool, width, theme.diff_added, theme.diff_deleted, theme.diff_unmatched));
                 }
                 ChecklistControl::ToggleView => {
                     view_mode = match view_mode {
@@ -219,13 +225,37 @@ impl Tui {
                     last_selected = None;
                 }
                 ChecklistControl::SelectVisualRow(row) => {
+                    let absolute = list_state.offset() + row;
                     match view_mode {
-                        ViewMode::Flat => checklist.select_index(row),
+                        ViewMode::Flat => checklist.select_index(absolute),
                         ViewMode::Tree => {
                             let tree = build_tree(&checklist.session.files);
-                            if let Some(TreeRow::File { file_index, .. }) = tree.get(row) {
+                            if let Some(TreeRow::File { file_index, .. }) = tree.get(absolute) {
                                 checklist.selected = *file_index;
                                 last_selected = None;
+                            }
+                        }
+                    }
+                }
+                ChecklistControl::SelectAdjacentFile(delta) => {
+                    match view_mode {
+                        ViewMode::Flat => {
+                            if delta > 0 { checklist.select_next(); } else { checklist.select_prev(); }
+                        }
+                        ViewMode::Tree => {
+                            let tree = build_tree(&checklist.session.files);
+                            let file_rows: Vec<usize> = tree.iter()
+                                .filter_map(|row| {
+                                    if let TreeRow::File { file_index, .. } = row { Some(*file_index) } else { None }
+                                })
+                                .collect();
+                            if let Some(pos) = file_rows.iter().position(|&fi| fi == checklist.selected) {
+                                let new_pos = if delta > 0 {
+                                    (pos + 1).min(file_rows.len().saturating_sub(1))
+                                } else {
+                                    pos.saturating_sub(1)
+                                };
+                                checklist.selected = file_rows[new_pos];
                             }
                         }
                     }
@@ -327,13 +357,13 @@ impl Tui {
             };
 
             list_state.select(selected_visual_row);
+            let item_count = items.len();
             let list = List::new(items).highlight_style(theme.list_highlight);
             frame.render_stateful_widget(list, list_chunks[0], list_state);
 
             let list_height = list_chunks[0].height as usize;
             let offset = list_state.offset();
-            let list_indicator =
-                scroll_indicator(offset > 0, offset + list_height < total, list_chunks[1].height);
+            let list_indicator = scrollbar(item_count, offset, list_height, list_chunks[1].height);
             frame.render_widget(Paragraph::new(list_indicator), list_chunks[1]);
 
             // Divider — label and hint vary by fullscreen state.
@@ -363,9 +393,7 @@ impl Tui {
                     preview_chunks[0],
                 );
                 let preview_height = preview_chunks[0].height as usize;
-                let above = preview_scroll > 0;
-                let below = preview_scroll + preview_height < text.lines.len();
-                let preview_indicator = scroll_indicator(above, below, preview_chunks[1].height);
+                let preview_indicator = scrollbar(text.lines.len(), preview_scroll, preview_height, preview_chunks[1].height);
                 frame.render_widget(Paragraph::new(preview_indicator), preview_chunks[1]);
             } else if total > 0 {
                 let spinner = BRAILLE_FRAMES[spinner_frame as usize];
@@ -435,6 +463,7 @@ struct WorkItem {
     width: u16,
     diff_added: Color,
     diff_deleted: Color,
+    diff_unmatched: Color,
 }
 
 struct DiffWorker {
@@ -452,7 +481,7 @@ impl DiffWorker {
                 let item = worker_queue.lock().expect("diff queue lock poisoned").pop_front();
                 match item {
                     Some(item) => {
-                        let text = capture_diff(&item.diff_tool, &item.path_a, &item.path_b, item.width, item.diff_added, item.diff_deleted)
+                        let text = capture_diff(&item.diff_tool, &item.path_a, &item.path_b, item.width, item.diff_added, item.diff_deleted, item.diff_unmatched)
                             .unwrap_or_default();
                         if tx.send((item.index, text)).is_err() {
                             break;
@@ -478,7 +507,7 @@ impl DiffWorker {
     }
 }
 
-fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16, diff_added: Color, diff_deleted: Color) -> VecDeque<WorkItem> {
+fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16, diff_added: Color, diff_deleted: Color, diff_unmatched: Color) -> VecDeque<WorkItem> {
     file_paths
         .iter()
         .enumerate()
@@ -490,6 +519,7 @@ fn work_items(file_paths: &[(PathBuf, PathBuf)], diff_tool: &str, width: u16, di
             width,
             diff_added,
             diff_deleted,
+            diff_unmatched,
         })
         .collect()
 }
@@ -615,6 +645,7 @@ enum ChecklistControl {
     ScrollPreview(i32),
     UpdateDrag(u16),
     SelectVisualRow(usize),
+    SelectAdjacentFile(i32),
     Resize,
 }
 
@@ -643,21 +674,26 @@ fn title_bar_line(ref_a: &str, ref_b: &str, width: u16, refresh_pending: bool) -
     }
 }
 
-fn scroll_indicator(above: bool, below: bool, height: u16) -> Text<'static> {
-    if height == 0 {
+fn scrollbar(total: usize, offset: usize, visible: usize, height: u16) -> Text<'static> {
+    let h = height as usize;
+    if h == 0 || total <= visible {
         return Text::default();
     }
-    let mut lines: Vec<Line<'static>> = (0..height).map(|_| Line::from(" ")).collect();
-    if above && below && height == 1 {
-        lines[0] = Line::from("↕");
+    let thumb_h = (visible * h / total).max(1);
+    let thumb_top = if total <= visible {
+        0
     } else {
-        if above {
-            lines[0] = Line::from("↑");
-        }
-        if below {
-            lines[height as usize - 1] = Line::from("↓");
-        }
-    }
+        offset * (h - thumb_h) / (total - visible)
+    };
+    let lines: Vec<Line<'static>> = (0..h)
+        .map(|i| {
+            if i >= thumb_top && i < thumb_top + thumb_h {
+                Line::from("█")
+            } else {
+                Line::from(" ")
+            }
+        })
+        .collect();
     Text::from(lines)
 }
 
@@ -756,7 +792,27 @@ fn active_notification(notification: &Option<(String, std::time::Instant)>) -> O
     notification.as_ref().map(|(s, _)| s.as_str())
 }
 
-fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16, diff_added: Color, diff_deleted: Color) -> Result<Text<'static>> {
+fn diff_line_numbers(text: &ratatui::text::Text, scroll: usize, width: u16) -> (Option<u32>, Option<u32>) {
+    let mid = (width / 2) as usize;
+    // Scan forward from scroll: header and separator lines carry no file line numbers.
+    for line in text.lines.iter().skip(scroll) {
+        let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+        let old_line = leading_number_in_chars(&chars[..mid.min(chars.len())]);
+        let new_line = leading_number_in_chars(&chars[mid.min(chars.len())..]);
+        if old_line.is_some() || new_line.is_some() {
+            return (old_line, new_line);
+        }
+    }
+    (None, None)
+}
+
+fn leading_number_in_chars(chars: &[char]) -> Option<u32> {
+    let start = chars.iter().position(|c| !c.is_whitespace())?;
+    let digits: String = chars[start..].iter().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
+}
+
+fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16, diff_added: Color, diff_deleted: Color, diff_unmatched: Color) -> Result<Text<'static>> {
     let null = Path::new("/dev/null");
     let mut parts = diff_tool.split_whitespace();
     let bin = parts.next().unwrap_or(diff_tool);
@@ -770,7 +826,7 @@ fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16, diff_
         .stdout(Stdio::piped())
         .output()?;
 
-    Ok(crate::ansi::parse(&output.stdout, diff_added, diff_deleted))
+    Ok(crate::ansi::parse(&output.stdout, diff_added, diff_deleted, diff_unmatched))
 }
 
 fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistControl {
@@ -779,14 +835,8 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ChecklistControl::Quit
         }
-        KeyCode::Char('u') | KeyCode::Down => {
-            checklist.select_next();
-            ChecklistControl::Continue
-        }
-        KeyCode::Char('i') | KeyCode::Up => {
-            checklist.select_prev();
-            ChecklistControl::Continue
-        }
+        KeyCode::Char('u') | KeyCode::Down => ChecklistControl::SelectAdjacentFile(1),
+        KeyCode::Char('i') | KeyCode::Up => ChecklistControl::SelectAdjacentFile(-1),
         KeyCode::Char(' ') => {
             checklist.toggle_reviewed();
             ChecklistControl::Save
@@ -838,7 +888,7 @@ fn handle_mouse(
             ChecklistControl::Continue
         }
         MouseEventKind::ScrollDown if mouse.row > divider_row => ChecklistControl::ScrollPreview(3),
-        MouseEventKind::ScrollUp if mouse.row > divider_row => ChecklistControl::ScrollPreview(-3),
+        MouseEventKind::ScrollUp   if mouse.row > divider_row => ChecklistControl::ScrollPreview(-3),
         _ => ChecklistControl::Continue,
     }
 }

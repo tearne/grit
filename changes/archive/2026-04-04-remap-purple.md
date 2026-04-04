@@ -15,10 +15,16 @@ A test is added to `ansi.rs` covering magenta foreground remapping, parallel to 
 Review cadence: per-task.
 
 ## Plan
-- [ ] UPDATE `theme.rs`: add `diff_unmatched: Color` to `Theme`; set per theme (`default`: `Color::Magenta`, `autumn`: muted lavender)
-- [ ] UPDATE `ansi.rs`: add `diff_unmatched` parameter to `parse`; thread through `apply_sgr` to `remap`; add `Magenta | LightMagenta` arms to `remap`
-- [ ] UPDATE `tui.rs`: pass `theme.diff_unmatched` at the `parse` call site
-- [ ] ADD `ansi.rs` test: magenta foreground remaps to `diff_unmatched`
+- [x] UPDATE `theme.rs`: add `diff_unmatched: Color` to `Theme`; set per theme (`default`: `Color::Magenta`, `autumn`: muted lavender)
+- [x] UPDATE `ansi.rs`: add `diff_unmatched` parameter to `parse`; thread through `apply_sgr` to `remap`; add `Magenta | LightMagenta` arms to `remap`
+- [x] UPDATE `tui.rs`: pass `theme.diff_unmatched` at the `parse` call site
+- [x] ADD `ansi.rs` test: magenta foreground remaps to `diff_unmatched`
+
+## Conclusion
+
+Delivered as planned. Threading `diff_unmatched` required updating `WorkItem`, `work_items`, and `capture_diff` in addition to the stated call site — the colour flows through the diff worker pipeline. Two tests added: standard magenta (ESC[35m) and bright magenta (ESC[95m). All 34 tests pass.
+
+**Fix (post-build):** `worktree::remove` was called while `tui` was still in scope, leaving the terminal in raw mode. `read_line` in the `[y/N]` prompt then blocked indefinitely, hanging the process. Added `drop(tui)` before the remove calls in `main.rs` to restore cooked mode first. v0.5.10 → v0.5.11.
 
 ## Intent
 Difftastic uses purple/magenta to mark characters it cannot place in the parsed syntax tree. This colour currently passes through grit's ANSI remapping unmodified, clashing with the active theme. It should be remapped alongside the existing added/deleted colours so the diff output feels consistent.
