@@ -793,12 +793,15 @@ fn active_notification(notification: &Option<(String, std::time::Instant)>) -> O
 }
 
 fn diff_line_numbers(text: &ratatui::text::Text, scroll: usize, width: u16) -> (Option<u32>, Option<u32>) {
-    let mid = (width / 2) as usize;
     // Scan forward from scroll: header and separator lines carry no file line numbers.
     for line in text.lines.iter().skip(scroll) {
         let chars: Vec<char> = line.spans.iter().flat_map(|s| s.content.chars()).collect();
-        let old_line = leading_number_in_chars(&chars[..mid.min(chars.len())]);
-        let new_line = leading_number_in_chars(&chars[mid.min(chars.len())..]);
+        let old_line = leading_number_in_chars(&chars);
+        // difft uses two formats: side-by-side (modifications) where the new-file number sits
+        // at ~width/2, and combined (pure additions/deletions) where both numbers appear at the
+        // line start as `old_num new_num content` or `. new_num content`.
+        let new_line = leading_number_in_chars(&chars[(width as usize / 2).min(chars.len())..])
+            .or_else(|| second_leading_number(&chars));
         if old_line.is_some() || new_line.is_some() {
             return (old_line, new_line);
         }
@@ -810,6 +813,19 @@ fn leading_number_in_chars(chars: &[char]) -> Option<u32> {
     let start = chars.iter().position(|c| !c.is_whitespace())?;
     let digits: String = chars[start..].iter().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() { None } else { digits.parse().ok() }
+}
+
+fn second_leading_number(chars: &[char]) -> Option<u32> {
+    // Parses the new-file number in difft's combined format: `old_num new_num content`
+    // or `. new_num content`, where exactly one space separates the two leading tokens.
+    let start = chars.iter().position(|c| !c.is_whitespace())?;
+    let after_first = chars[start..].iter().position(|c| c.is_whitespace())?;
+    let gap = start + after_first;
+    if chars.get(gap) == Some(&' ') && chars.get(gap + 1).map_or(false, |c| !c.is_whitespace()) {
+        leading_number_in_chars(&chars[gap + 1..])
+    } else {
+        None
+    }
 }
 
 fn capture_diff(diff_tool: &str, path_a: &Path, path_b: &Path, width: u16, diff_added: Color, diff_deleted: Color, diff_unmatched: Color) -> Result<Text<'static>> {

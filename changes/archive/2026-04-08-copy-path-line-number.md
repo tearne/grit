@@ -23,3 +23,14 @@ Review cadence: single review at completion.
 - [x] ADD `tui.rs`: `diff_line_numbers(text: &Text, scroll: usize, width: u16) -> (Option<u32>, Option<u32>)` — reconstruct plain text of the line at `scroll`, parse leading integer for old line (left column), parse leading integer at ~`width / 2` for new line (right column)
 - [x] UPDATE `tui.rs`: `CopyPathOld` and `CopyPathNew` handlers call `diff_line_numbers` and fall back to `preview_scroll as u32 + 1` when `None`
 - [x] UPDATE `SPEC.md`: replace "The line number always reflects the current preview scroll position (`scroll + 1`)" with behaviour derived from diff output with scroll+1 fallback
+- [x] TEST: user to verify that copied path contains the correct file line number
+
+## Log
+
+2026-04-08: Implementation tasks completed but testing not done. Believed to not currently be working. Parked to `ready/` for later revisit.
+
+2026-04-08: User confirmed working after reconnecting to resume the build.
+
+## Conclusion
+
+Implemented `diff_line_numbers` to parse file line numbers from `difft`'s rendered output, replacing the scroll-offset fallback with accurate old/new file line numbers for `CopyPathOld` and `CopyPathNew`.

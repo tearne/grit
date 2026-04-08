@@ -83,7 +83,7 @@ pub(crate) fn remove(repo_root: &Path, worktree: Worktree) -> Result<()> {
         return Ok(());
     };
 
-    if !confirmed_safe_to_remove(&path)? {
+    if !is_managed(&path, repo_root) && !confirmed_safe_to_remove(&path)? {
         return Ok(());
     }
 

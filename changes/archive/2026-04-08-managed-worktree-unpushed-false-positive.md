@@ -14,7 +14,11 @@ The existing test `has_unpushed_commits_returns_true_when_no_remote` remains val
 Review cadence: single review at completion.
 
 ## Plan
-- [ ] UPDATE `worktree.rs`: in `remove`, after extracting `path`, add an early return that skips `confirmed_safe_to_remove` when `is_managed(&path, repo_root)` is true
+- [x] UPDATE `worktree.rs`: in `remove`, after extracting `path`, add an early return that skips `confirmed_safe_to_remove` when `is_managed(&path, repo_root)` is true
+
+## Conclusion
+
+Short-circuited `confirmed_safe_to_remove` in `remove` for managed worktrees by changing the guard to `!is_managed(&path, repo_root) && !confirmed_safe_to_remove(&path)?`. No other changes were needed.
 
 ## Feedback
 
