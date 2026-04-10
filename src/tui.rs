@@ -16,11 +16,11 @@ use ratatui::crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, List, ListItem, ListState, Paragraph},
-    Terminal,
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    Frame, Terminal,
 };
 
 use crate::checklist::Checklist;
@@ -68,6 +68,7 @@ impl Tui {
         let mut saved_split: Option<u16> = None;
         let mut refresh_pending = false;
         let mut view_mode = ViewMode::Tree;
+        let mut show_help = false;
 
         let mut file_paths = build_file_paths(&checklist.session.files, worktree_a, worktree_b);
 
@@ -103,7 +104,7 @@ impl Tui {
 
             let preview = cached.get(&checklist.selected);
             let active_notif = active_notification(&notification);
-            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, preview_scroll, split_row, active_notif, &theme, saved_split.is_some(), refresh_pending, view_mode)?;
+            self.render_checklist(checklist, &mut list_state, preview, spinner_frame, preview_scroll, split_row, active_notif, &theme, saved_split.is_some(), refresh_pending, view_mode, show_help)?;
 
             if last_refresh.elapsed() >= std::time::Duration::from_secs(auto_refresh) {
                 if checklist.session.has_pending_changes(repo_root)? {
@@ -112,7 +113,7 @@ impl Tui {
                 last_refresh = std::time::Instant::now();
             }
 
-            match self.next_checklist_event(checklist, split_row, &mut dragging, !all_done, saved_split.is_some(), width)? {
+            match self.next_checklist_event(checklist, split_row, &mut dragging, !all_done, saved_split.is_some(), width, show_help)? {
                 ChecklistControl::Continue => {}
                 ChecklistControl::Save => checklist.session.save(repo_root)?,
                 ChecklistControl::Refresh => {
@@ -224,6 +225,9 @@ impl Tui {
                     };
                     last_selected = None;
                 }
+                ChecklistControl::ToggleHelp => {
+                    show_help = !show_help;
+                }
                 ChecklistControl::SelectVisualRow(row) => {
                     let absolute = list_state.offset() + row;
                     match view_mode {
@@ -255,7 +259,13 @@ impl Tui {
                                 } else {
                                     pos.saturating_sub(1)
                                 };
-                                checklist.selected = file_rows[new_pos];
+                                if new_pos == pos && delta < 0 {
+                                    // Already at the topmost file — scroll the viewport up so
+                                    // dir headers above it can be revealed one line at a time.
+                                    *list_state.offset_mut() = list_state.offset().saturating_sub(1);
+                                } else {
+                                    checklist.selected = file_rows[new_pos];
+                                }
                             }
                         }
                     }
@@ -277,6 +287,7 @@ impl Tui {
         fullscreen: bool,
         refresh_pending: bool,
         view_mode: ViewMode,
+        show_help: bool,
     ) -> Result<()> {
         let session = &checklist.session;
         let total = session.files.len();
@@ -296,7 +307,8 @@ impl Tui {
                 ])
                 .split(area);
 
-            let title_bar = Paragraph::new(title_bar_line(&session.ref_a, &session.ref_b, vertical[0].width, refresh_pending))
+            let reviewed = session.files.iter().filter(|f| matches!(f.state, crate::session::ReviewState::ReviewedStable | crate::session::ReviewState::ReviewedDirty)).count();
+            let title_bar = Paragraph::new(title_bar_line(&session.ref_a, &session.ref_b, vertical[0].width, refresh_pending, reviewed, total))
                 .style(theme.title_bar);
             frame.render_widget(title_bar, vertical[0]);
 
@@ -367,18 +379,28 @@ impl Tui {
             frame.render_widget(Paragraph::new(list_indicator), list_chunks[1]);
 
             // Divider — label and hint vary by fullscreen state.
-            let (left, right) = if fullscreen {
+            let divider_text = if fullscreen {
                 let path = checklist.selected_file()
                     .map(|f| f.path.display().to_string())
                     .unwrap_or_default();
-                (format!("─── {path} · Enter to restore "), " ───".to_string())
+                let left = format!("─── {path} · Enter to restore ");
+                let right = " ───";
+                let fill_len = (area.width as usize)
+                    .saturating_sub(left.chars().count() + right.chars().count());
+                format!("{left}{}{right}", "─".repeat(fill_len))
             } else {
-                ("─── Preview · Enter to expand ".to_string(), " -/= resize ───".to_string())
+                let left  = "─── Y:old ";
+                let mid   = " -/= ↓/↑ ";
+                let right = " y:new ───";
+                let width = area.width as usize;
+                let total_fill = width
+                    .saturating_sub(left.chars().count() + mid.chars().count() + right.chars().count());
+                let fill_left = (width / 2)
+                    .saturating_sub(left.chars().count() + mid.chars().count() / 2);
+                let fill_right = total_fill.saturating_sub(fill_left);
+                format!("{left}{}{mid}{}{right}", "─".repeat(fill_left), "─".repeat(fill_right))
             };
-            let fill_len = (area.width as usize)
-                .saturating_sub(left.chars().count() + right.chars().count());
-            let divider = Paragraph::new(format!("{left}{}{right}", "─".repeat(fill_len)))
-                .style(theme.divider);
+            let divider = Paragraph::new(divider_text).style(theme.divider);
             frame.render_widget(divider, vertical[2]);
 
             // Preview with scroll-indicator column.
@@ -403,18 +425,20 @@ impl Tui {
                 );
             }
 
-            let footer_text = notification.unwrap_or(
-                " u/i navigate   j/k scroll preview   space toggle reviewed   r refresh   y/Y copy path (new/old)   v tree/flat",
-            );
-            let footer_style = if notification.is_some() {
-                theme.footer_notification
+            let (footer_text, footer_style) = if let Some(notif) = notification {
+                (format!(" {notif}"), theme.footer_notification)
             } else {
-                theme.footer
+                let left  = format!(" grit v{}", env!("CARGO_PKG_VERSION"));
+                let right = "? for help ";
+                let width = vertical[4].width as usize;
+                let pad = width.saturating_sub(left.chars().count() + right.chars().count());
+                (format!("{left}{}{right}", " ".repeat(pad)), theme.footer)
             };
-            frame.render_widget(
-                Paragraph::new(format!(" {footer_text}")).style(footer_style),
-                vertical[4],
-            );
+            frame.render_widget(Paragraph::new(footer_text).style(footer_style), vertical[4]);
+
+            if show_help {
+                render_help_modal(frame, area, theme);
+            }
         })?;
 
         Ok(())
@@ -428,6 +452,7 @@ impl Tui {
         loading: bool,
         fullscreen: bool,
         width: u16,
+        show_help: bool,
     ) -> Result<ChecklistControl> {
         let timeout = if loading {
             Duration::from_millis(100)
@@ -438,6 +463,7 @@ impl Tui {
             return Ok(ChecklistControl::Continue);
         }
         match event::read()? {
+            Event::Key(_) if show_help => Ok(ChecklistControl::ToggleHelp),
             Event::Key(key) => Ok(handle_checklist_key(key, checklist)),
             Event::Mouse(mouse) => Ok(handle_mouse(mouse, split_row, dragging, fullscreen, width)),
             Event::Resize(_, _) => Ok(ChecklistControl::Resize),
@@ -638,6 +664,7 @@ enum ChecklistControl {
     CycleTheme,
     ToggleFullscreen,
     ToggleView,
+    ToggleHelp,
     CopyPathNew,
     CopyPathOld,
     Quit,
@@ -655,12 +682,12 @@ enum ViewMode {
     Tree,
 }
 
-fn title_bar_line(ref_a: &str, ref_b: &str, width: u16, refresh_pending: bool) -> Line<'static> {
+fn title_bar_line(ref_a: &str, ref_b: &str, width: u16, refresh_pending: bool, reviewed: usize, total: usize) -> Line<'static> {
     let left = format!("  {}  →  {}", ref_a, ref_b);
     let right = if refresh_pending {
         "  Changes detected — press r to refresh  ".to_string()
     } else {
-        format!("grit v{}  ", env!("CARGO_PKG_VERSION"))
+        format!("  {} / {}  ", reviewed, total)
     };
     let padding = (width as usize).saturating_sub(left.len() + right.len());
     let padded_left = format!("{}{}", left, " ".repeat(padding));
@@ -860,6 +887,7 @@ fn handle_checklist_key(key: KeyEvent, checklist: &mut Checklist) -> ChecklistCo
         KeyCode::Char('r') => ChecklistControl::Refresh,
         KeyCode::Char('t') => ChecklistControl::CycleTheme,
         KeyCode::Char('v') => ChecklistControl::ToggleView,
+        KeyCode::Char('?') => ChecklistControl::ToggleHelp,
         KeyCode::Enter => ChecklistControl::ToggleFullscreen,
         KeyCode::Char('y') => ChecklistControl::CopyPathNew,
         KeyCode::Char('Y') => ChecklistControl::CopyPathOld,
@@ -907,4 +935,31 @@ fn handle_mouse(
         MouseEventKind::ScrollUp   if mouse.row > divider_row => ChecklistControl::ScrollPreview(-3),
         _ => ChecklistControl::Continue,
     }
+}
+
+fn render_help_modal(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let lines = [
+        "  u / i      next / prev file",
+        "  space      toggle reviewed",
+        "  j / k      scroll preview",
+        "  Enter      fullscreen / restore",
+        "  y / Y      copy path (new / old)",
+        "  - / =      resize preview",
+        "  v          tree / flat view",
+        "  t          cycle theme",
+        "  r          refresh",
+        "  ?          close this help",
+    ];
+    let modal_width: u16 = 44;
+    let modal_height: u16 = lines.len() as u16 + 2;
+    let x = area.x + area.width.saturating_sub(modal_width) / 2;
+    let y = area.y + area.height.saturating_sub(modal_height) / 2;
+    let modal_area = Rect::new(x, y, modal_width.min(area.width), modal_height.min(area.height));
+    frame.render_widget(Clear, modal_area);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .block(Block::default().title(" Keys ").borders(Borders::ALL))
+            .style(theme.title_bar),
+        modal_area,
+    );
 }
